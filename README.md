@@ -490,9 +490,12 @@ hosts the model in a local Analysis Services instance on `localhost:<port>`.
 That instance speaks the native Analysis Services TCP protocol with Windows
 authentication, not XMLA over HTTP.
 
-The current build ships only a diagnostic function, which is Windows only:
+The current build ships two experimental functions, both Windows only:
 
 ```sql
+-- Open Desktop models: report name, port, catalog and a ready connection string
+SELECT report_name, port, connection_string FROM pbi_local_instances();
+-- Handshake diagnostics for one instance
 SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');
 ```
 

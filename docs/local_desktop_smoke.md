@@ -16,10 +16,38 @@ This is the Windows runtime check for the local Desktop work. It needs:
 3. Download the DuckDB `v1.5.6` Windows CLI (`duckdb_cli-windows-amd64.zip`)
    from the DuckDB GitHub releases page and unzip `duckdb.exe` next to it.
 
-## 2. Find the Desktop port
+## 2. Find the open models and their ports
 
-Run this in PowerShell with the model open in Desktop. It covers the regular
-and the Microsoft Store installs. The port file is UTF-16.
+Have one or more models open in Desktop. Then run:
+
+```powershell
+$ext = (Resolve-Path .\pbi_scanner.duckdb_extension).Path
+.\duckdb.exe -unsigned -c "LOAD '$ext'; COPY (SELECT * FROM pbi_local_instances()) TO 'instances.csv' (HEADER);"
+Get-Content instances.csv
+```
+
+`pbi_local_instances()` returns one row per running `msmdsrv.exe`:
+
+| column | meaning |
+| --- | --- |
+| `report_name` | Taken from the `PBIDesktop.exe` window title (`<name> - Power BI Desktop`). |
+| `port` | The listening TCP port of `msmdsrv.exe`. |
+| `catalog` | The database GUID, from `DBSCHEMA_CATALOGS`. |
+| `connection_string` | `Data Source=localhost:<port>;Initial Catalog=<guid>;`, ready for `dax_query`. |
+| `msmdsrv_pid`, `desktop_pid` | The process IDs. |
+| `window_title` | The raw window title. |
+| `workspace_path` | The workspace folder whose `msmdsrv.port.txt` holds this port. |
+| `detail` | Problems such as a failed catalog lookup, or more than one catalog. |
+
+Options:
+
+- `discover_catalog := false` skips the TCP/SSPI lookup.
+- `protection := 'none' | 'integrity' | 'privacy'` sets message protection.
+- `timeout_ms := 10000` sets the timeout in milliseconds.
+
+Compare the result with what you see. Is every open report listed? Are the
+report names correct? Do the ports match `msmdsrv.port.txt`? The manual
+fallback is below. Note that the port file is UTF-16.
 
 ```powershell
 $roots = @(
@@ -34,10 +62,12 @@ $port
 
 ## 3. Spike run: `pbi_local_probe`
 
-Run this once from the folder that holds `duckdb.exe` and the extension. It
-writes two files that answer every spike question in one go.
+Run this once from the folder that holds `duckdb.exe` and the extension. Set
+`$port` to a port from step 2. It writes two files that answer every spike
+question in one go.
 
 ```powershell
+$port = 60790   # replace with a port from instances.csv
 $env:PBI_SCANNER_LOCAL_TRACE = "1"
 $ext = (Resolve-Path .\pbi_scanner.duckdb_extension).Path
 .\duckdb.exe -unsigned -c "LOAD '$ext'; COPY (SELECT * FROM pbi_local_probe('Data Source=localhost:$port;')) TO 'probe.csv' (HEADER);" 2> probe_trace.txt
@@ -64,7 +94,8 @@ Each attempt reports these steps:
 Failures show up as `ok = false` with the server or SSPI message. A failure
 does not stop the later attempts.
 
-Send back `probe.csv` and `probe_trace.txt`. **Privacy note:** `sspi_context`
+Send back `instances.csv`, `probe.csv` and `probe_trace.txt`. `instances.csv`
+contains report names and local paths. **Privacy note:** `sspi_context`
 contains your Windows user name, and the trace contains hex previews of the
 SSPI tokens, which include your user, domain and machine names. Redact them if
 you like. The rest is protocol metadata.
@@ -78,6 +109,9 @@ SELECT * FROM pbi_local_probe('Data Source=localhost:<port>;', protection := 'no
 ```
 
 ## 4. Full smoke (after `dax_query` supports local targets)
+
+The connection string can come straight from `pbi_local_instances()`:
+`SELECT connection_string FROM pbi_local_instances() WHERE report_name = 'Sales Model';`.
 
 These checks run once local targets are wired into `dax_query`. They are not
 available in the spike build yet.

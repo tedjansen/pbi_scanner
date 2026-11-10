@@ -61,6 +61,19 @@ Xpress decompression and the plain/binary XML parsers are reused unchanged.
 
   It returns one row per step. `PBI_SCANNER_LOCAL_TRACE=1` adds hex previews
   of every message on stderr.
+- `src/local_instances.cpp`: the `pbi_local_instances()` table function
+  (Windows only). It builds the list as follows:
+  - lists `msmdsrv.exe` processes (Toolhelp snapshot);
+  - gets their listening ports (`GetExtendedTcpTable`, IPv4 and IPv6). This
+    is more reliable than port files, which stay behind after a crash;
+  - finds the parent `PBIDesktop.exe` and its top-level window title
+    (`<report> - Power BI Desktop`) for the report name;
+  - matches ports to `AnalysisServicesWorkspaces\*\Data\msmdsrv.port.txt`
+    (UTF-16) for the workspace folder;
+  - optionally discovers the catalog GUID over TCP;
+  - returns a ready `connection_string`.
+
+  The port file parser and the title parsing are tested offline.
 
 ## Open questions the Windows probe answers
 
@@ -74,6 +87,9 @@ Xpress decompression and the plain/binary XML parsers are reused unchanged.
 4. Does the server honour `RESP_SX|RESP_XPRESS` on TCP? Which TYPE and OPTIONS
    does it send back? Do the existing parsers decode the payload?
 5. Does `DBSCHEMA_CATALOGS` return exactly one GUID-named catalog?
+6. Does `pbi_local_instances()` find every open report? Are the window title
+   heuristics right for the installed Desktop version and language? This
+   covers unsaved reports ("Untitled") and the Microsoft Store install.
 
 ## Planned public surface
 
@@ -110,7 +126,7 @@ Xpress decompression and the plain/binary XML parsers are reused unchanged.
 ## Out of scope (follow-ups)
 
 - RLS testing against Desktop (`Roles=`, `EffectiveUserName`).
-- Automatic port discovery inside the extension. Callers read
-  `msmdsrv.port.txt`.
+- Resolving `Data Source=<report name>` automatically inside `dax_query`.
+  Callers select a `connection_string` from `pbi_local_instances()`.
 - On-premises SSAS over the network, Kerberos delegation, and explicit
   credentials.
