@@ -18,6 +18,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 
+#include <algorithm>
 #include <string>
 
 using namespace duckdb;
@@ -703,5 +704,136 @@ TEST_CASE("Local Desktop functions are Windows only", "[local_instances]") {
   REQUIRE_THAT(probe->GetError(),
                Catch::Matchers::Contains("only supported in native Windows "
                                          "builds of pbi_scanner"));
+}
+#endif
+
+TEST_CASE("Parse local Power BI Desktop connection strings",
+          "[connection_string]") {
+  auto local = ParsePowerBIConnectionString("Data Source=localhost:60790;");
+  REQUIRE(local.is_local_instance);
+  REQUIRE(!local.is_direct_xmla);
+  REQUIRE(local.local_host == "localhost");
+  REQUIRE(local.local_port == 60790);
+  REQUIRE(local.initial_catalog.empty());
+
+  auto with_catalog = ParsePowerBIConnectionString(
+      "Data Source=127.0.0.1:5132;Initial Catalog=0f1e2d3c-aaaa-bbbb-cccc-"
+      "000000000001;TimeoutMs=5000;");
+  REQUIRE(with_catalog.is_local_instance);
+  REQUIRE(with_catalog.local_host == "127.0.0.1");
+  REQUIRE(with_catalog.local_port == 5132);
+  REQUIRE(with_catalog.initial_catalog ==
+          "0f1e2d3c-aaaa-bbbb-cccc-000000000001");
+  REQUIRE(with_catalog.has_timeout_ms);
+
+  REQUIRE_THROWS_WITH(
+      ParsePowerBIConnectionString("Data Source=localhost;"),
+      Catch::Matchers::Contains("Local Data Source must be localhost:<port>"));
+  // Remote host:port stays unsupported (no on-premises SSAS over the network).
+  REQUIRE_THROWS_WITH(
+      ParsePowerBIConnectionString(
+          "Data Source=server.example:2383;Initial Catalog=db;"),
+      Catch::Matchers::Contains("powerbi://"));
+  // Loopback HTTP XMLA keeps its existing meaning.
+  REQUIRE(ParsePowerBIConnectionString(
+              "Data Source=http://localhost:8123/xmla;Initial Catalog=mock;")
+              .is_direct_xmla);
+}
+
+TEST_CASE("XMLA TCP response reader unwraps protected DIME messages",
+          "[xmla_tcp]") {
+  // Fake GSS-API wrap: the "ciphertext" is the reversed plaintext and the
+  // token must be "TK". Real decryption is SSPI on Windows.
+  std::string plain;
+  for (int i = 0; i < 5000; i++) {
+    plain.push_back(static_cast<char>('A' + (i % 23)));
+  }
+  std::string wrapped;
+  for (size_t offset = 0; offset < plain.size(); offset += 700) {
+    auto block = plain.substr(offset, 700);
+    std::reverse(block.begin(), block.end());
+    wrapped += EncodeGssWrapBlock(block, "TK");
+  }
+  auto wire = EncodeDimeMessage("application/sx+xpress", 0x1e, wrapped, 999);
+  auto unwrap = [](const std::string &data, const std::string &token) {
+    REQUIRE(token == "TK");
+    return std::string(data.rbegin(), data.rend());
+  };
+
+  for (size_t slice : {size_t(1), size_t(17), size_t(4096)}) {
+    std::string out;
+    XmlaTcpResponseReader reader(unwrap, [&](const_data_ptr_t d, idx_t n) {
+      out.append(reinterpret_cast<const char *>(d), n);
+      return true;
+    });
+    idx_t consumed = 0;
+    for (size_t i = 0; i < wire.size() && !reader.MessageComplete();
+         i += slice) {
+      consumed += reader.Feed(const_data_ptr_cast(wire.data()) + i,
+                              std::min(slice, wire.size() - i));
+    }
+    REQUIRE(reader.MessageComplete());
+    REQUIRE_NOTHROW(reader.Finish());
+    REQUIRE(consumed == wire.size());
+    REQUIRE(out == plain);
+    REQUIRE(reader.PlainBytes() == plain.size());
+    REQUIRE(reader.ContentType() == "application/sx+xpress");
+    REQUIRE(reader.CapsFlags() == 0x1e);
+  }
+
+  // Stopping early (query cancelled) stops reading before the message ends.
+  std::string first;
+  XmlaTcpResponseReader stopping(unwrap, [&](const_data_ptr_t d, idx_t n) {
+    first.append(reinterpret_cast<const char *>(d), n);
+    return false;
+  });
+  stopping.Feed(const_data_ptr_cast(wire.data()), wire.size());
+  REQUIRE(stopping.Stopped());
+  REQUIRE(!stopping.MessageComplete());
+  REQUIRE(first == plain.substr(0, 700));
+
+  // Unprotected connections pass DIME data straight through.
+  std::string clear;
+  XmlaTcpResponseReader passthrough(
+      XmlaTcpResponseReader::Unwrap(), [&](const_data_ptr_t d, idx_t n) {
+        clear.append(reinterpret_cast<const char *>(d), n);
+        return true;
+      });
+  auto clear_wire = EncodeDimeMessage("text/xml", 0x01, "<root/>");
+  passthrough.Feed(const_data_ptr_cast(clear_wire.data()), clear_wire.size());
+  REQUIRE(passthrough.MessageComplete());
+  REQUIRE(clear == "<root/>");
+
+  // A protected message that ends mid-block is an error.
+  auto truncated_wire =
+      EncodeDimeMessage("text/xml", 0x01, wrapped.substr(0, 100));
+  XmlaTcpResponseReader truncated(unwrap, nullptr);
+  truncated.Feed(const_data_ptr_cast(truncated_wire.data()),
+                 truncated_wire.size());
+  REQUIRE_THROWS_WITH(truncated.Finish(),
+                      Catch::Matchers::Contains("Truncated GSS-API"));
+
+  REQUIRE(XmlaTcpCapsForTransport(false, false) == XMLA_TCP_CAPS_NEGO);
+  REQUIRE(XmlaTcpCapsForTransport(true, true) == 0x19);
+  REQUIRE(XmlaTcpCapsForTransport(false, true) == 0x11);
+}
+
+#ifndef _WIN32
+TEST_CASE("dax_query local targets are Windows only", "[local_instances]") {
+  DuckDB db(nullptr);
+  ExtensionHelper::LoadExtension(db, "pbi_scanner");
+  Connection con(db);
+  for (auto sql :
+       {"SELECT * FROM dax_query('Data Source=localhost:60790;', "
+        "'EVALUATE ROW(\"x\", 1)')",
+        "SELECT * FROM pbi_tables('Data Source=localhost:60790;')"}) {
+    auto result = con.Query(sql);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(),
+                 Catch::Matchers::Contains(
+                     "Local Power BI Desktop connections (Data "
+                     "Source=localhost:<port>) are only supported in native "
+                     "Windows builds of pbi_scanner"));
+  }
 }
 #endif

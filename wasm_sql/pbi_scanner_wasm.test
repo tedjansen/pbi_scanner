@@ -287,3 +287,8 @@ statement error
 SELECT * FROM pbi_local_instances();
 ----
 pbi_local_instances is only supported in native Windows builds of pbi_scanner
+
+statement error
+SELECT * FROM dax_query('Data Source=localhost:60790;', 'EVALUATE ROW("x", 1)');
+----
+Local Power BI Desktop connections (Data Source=localhost:<port>) are only supported in native Windows builds of pbi_scanner

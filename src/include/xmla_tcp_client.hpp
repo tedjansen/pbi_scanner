@@ -48,6 +48,17 @@ public:
   //! Sends one SOAP envelope as a text/xml DIME message with the given
   //! [MS-SSAS] 2.1.1 OPTIONS flags and returns the full response message.
   LocalXmlaResponse RoundTrip(const std::string &envelope, uint8_t caps_flags);
+  //! Like RoundTrip, but streams the decrypted response body to on_data and
+  //! leaves LocalXmlaResponse::body empty. When on_data returns false the
+  //! read stops early, stopped_out is set and the connection must be closed.
+  LocalXmlaResponse
+  RoundTripStream(const std::string &envelope, uint8_t caps_flags,
+                  const std::function<bool(const_data_ptr_t, idx_t)> &on_data,
+                  bool &stopped_out);
+  //! Connected and authenticated.
+  bool IsConnected() const;
+  //! Thread-safe interrupt of a blocked read (used for query cancellation).
+  void Abort();
   void Close();
 
 private:

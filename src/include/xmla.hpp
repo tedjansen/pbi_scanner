@@ -1,6 +1,7 @@
 #pragma once
 
 #include "http_client.hpp"
+#include "xmla_tcp_client.hpp"
 #include "xmla_transport.hpp"
 
 #include "duckdb/common/types/value.hpp"
@@ -44,6 +45,13 @@ struct XmlaRequest {
   std::string statement;
   std::string effective_user_name;
   int64_t timeout_ms = 300000;
+  //! Set for a local Analysis Services instance (Power BI Desktop): the
+  //! request goes over the native TCP protocol instead of HTTP.
+  std::string local_host;
+  uint16_t local_port = 0;
+  std::string local_protection = "privacy";
+
+  bool IsLocal() const { return local_port != 0; }
 };
 
 struct XmlaParseTestResult {
@@ -76,6 +84,13 @@ public:
   explicit XmlaExecutor(int64_t timeout_ms);
   //! Reuses the same HTTP connection (keep-alive) across ProbeSchema + execute.
   XmlaExecutor(int64_t timeout_ms, std::shared_ptr<HttpClient> shared_http);
+  //! Reuses the same authenticated local TCP connection across calls.
+  XmlaExecutor(int64_t timeout_ms, std::shared_ptr<HttpClient> shared_http,
+               std::shared_ptr<LocalXmlaTcpClient> shared_local);
+
+  //! Local targets only: returns the CATALOG_NAME values from
+  //! DBSCHEMA_CATALOGS (Power BI Desktop hosts exactly one).
+  vector<string> DiscoverLocalCatalogs(const XmlaRequest &request);
 
   std::vector<XmlaColumn> ProbeSchema(const XmlaRequest &request);
   void ExecuteStreaming(
@@ -87,8 +102,16 @@ public:
   void Stop();
 
 private:
+  HttpResponse
+  PostXmla(const XmlaRequest &request, XmlaTransportMode transport_mode,
+           const std::string &envelope,
+           const std::function<bool(const_data_ptr_t, idx_t)> &receiver,
+           bool disconnect_after_response);
+  LocalXmlaTcpClient &EnsureLocalConnection(const XmlaRequest &request);
+
   int64_t timeout_ms;
   std::shared_ptr<HttpClient> http;
+  std::shared_ptr<LocalXmlaTcpClient> local;
 };
 
 } // namespace duckdb

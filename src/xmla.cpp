@@ -3,10 +3,12 @@
 #include "pbi_scanner_util.hpp"
 #include "xmla_transport.hpp"
 #include "xmla_util.hpp"
+#include "xmla_tcp.hpp"
 #include "xmla_value.hpp"
 #include "xpress.hpp"
 
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -3390,9 +3392,95 @@ XmlaExecutor::XmlaExecutor(int64_t timeout_ms_p)
 
 XmlaExecutor::XmlaExecutor(int64_t timeout_ms_p,
                            std::shared_ptr<HttpClient> shared_http)
+    : XmlaExecutor(timeout_ms_p, std::move(shared_http), nullptr) {}
+
+XmlaExecutor::XmlaExecutor(int64_t timeout_ms_p,
+                           std::shared_ptr<HttpClient> shared_http,
+                           std::shared_ptr<LocalXmlaTcpClient> shared_local)
     : timeout_ms(timeout_ms_p > 0 ? timeout_ms_p : 300000),
       http(shared_http ? std::move(shared_http)
-                       : std::make_shared<HttpClient>(timeout_ms)) {}
+                       : std::make_shared<HttpClient>(timeout_ms)),
+      local(std::move(shared_local)) {}
+
+LocalXmlaTcpClient &
+XmlaExecutor::EnsureLocalConnection(const XmlaRequest &request) {
+  if (!local) {
+    local = std::make_shared<LocalXmlaTcpClient>(timeout_ms, nullptr);
+  }
+  if (!local->IsConnected()) {
+    local->Connect(request.local_host, request.local_port);
+    LocalXmlaAuthOptions auth;
+    auth.protection = request.local_protection;
+    local->Authenticate(auth);
+  }
+  return *local;
+}
+
+HttpResponse XmlaExecutor::PostXmla(
+    const XmlaRequest &request, XmlaTransportMode transport_mode,
+    const std::string &envelope,
+    const std::function<bool(const_data_ptr_t, idx_t)> &receiver,
+    bool disconnect_after_response) {
+  if (!request.IsLocal()) {
+    return http->PostStream(request.url, XmlaHeaders(request, transport_mode),
+                            envelope, "text/xml", receiver,
+                            disconnect_after_response);
+  }
+  // Native Analysis Services TCP: the DIME TYPE plays the role of the HTTP
+  // Content-Type, so the HTTP response decoders apply unchanged.
+  HttpResponse response;
+  try {
+    auto &client = EnsureLocalConnection(request);
+    bool stopped = false;
+    auto start = std::chrono::steady_clock::now();
+    auto local_response = client.RoundTripStream(
+        envelope,
+        XmlaTcpCapsForTransport(XmlaTransportIsSx(transport_mode),
+                                transport_mode == XmlaTransportMode::XPRESS ||
+                                    transport_mode ==
+                                        XmlaTransportMode::SX_XPRESS),
+        [&](const_data_ptr_t data, idx_t size) {
+          response.streamed_bytes += size;
+          response.streamed_chunks++;
+          return receiver(data, size);
+        },
+        stopped);
+    response.status = 200;
+    response.headers.emplace_back("Content-Type", local_response.content_type);
+    response.stream_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    if (stopped || disconnect_after_response) {
+      // An abandoned response leaves unread bytes on the socket.
+      client.Close();
+    }
+  } catch (const InvalidInputException &) {
+    throw;
+  } catch (const std::exception &ex) {
+    if (local) {
+      local->Close();
+    }
+    ErrorData error(ex);
+    response.request_error = error.RawMessage();
+  }
+  return response;
+}
+
+vector<string> XmlaExecutor::DiscoverLocalCatalogs(const XmlaRequest &request) {
+  if (!request.IsLocal()) {
+    throw InternalException("DiscoverLocalCatalogs requires a local target");
+  }
+  auto &client = EnsureLocalConnection(request);
+  try {
+    auto response = client.RoundTrip(BuildXmlaDiscoverCatalogsEnvelope(),
+                                     XMLA_TCP_CAPS_NEGO);
+    return ParseXmlaCatalogNames(response.body);
+  } catch (...) {
+    client.Close();
+    throw;
+  }
+}
 
 std::vector<XmlaColumn> XmlaExecutor::ProbeSchema(const XmlaRequest &request) {
   auto transport_mode = ResolveXmlaTransportMode();
@@ -3406,9 +3494,8 @@ std::vector<XmlaColumn> XmlaExecutor::ProbeSchema(const XmlaRequest &request) {
   XmlaStreamParser parser(
       true, [&](const std::vector<XmlaColumn> &columns) { schema = columns; },
       nullptr);
-  auto response = http->PostStream(
-      request.url, XmlaHeaders(request, schema_transport_mode), envelope,
-      "text/xml",
+  auto response = PostXmla(
+      request, schema_transport_mode, envelope,
       [&](const_data_ptr_t data, idx_t data_length) {
         if (buffer_response) {
           buffered_response.append(reinterpret_cast<const char *>(data),
@@ -3519,8 +3606,8 @@ void XmlaExecutor::ExecuteStreaming(
     return true;
   };
 #endif
-  auto response = http->PostStream(
-      request.url, XmlaHeaders(request, transport_mode), envelope, "text/xml",
+  auto response = PostXmla(
+      request, transport_mode, envelope,
       [&](const_data_ptr_t data, idx_t data_length) {
         if (should_stop && should_stop()) {
           return false;
@@ -3606,6 +3693,11 @@ void XmlaExecutor::ExecuteStreaming(
                        decoded_response);
 }
 
-void XmlaExecutor::Stop() { http->Stop(); }
+void XmlaExecutor::Stop() {
+  http->Stop();
+  if (local) {
+    local->Abort();
+  }
+}
 
 } // namespace duckdb

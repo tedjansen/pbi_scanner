@@ -423,6 +423,58 @@ void GssWrapBlockReader::Finish() const {
   }
 }
 
+XmlaTcpResponseReader::XmlaTcpResponseReader(Unwrap unwrap_p,
+                                             DataCallback on_plain_p)
+    : unwrap(std::move(unwrap_p)), on_plain(std::move(on_plain_p)),
+      dime([this](const_data_ptr_t data, idx_t size) {
+        if (!wrap_reader) {
+          plain_bytes += size;
+          if (on_plain && !on_plain(data, size)) {
+            stopped = true;
+            return false;
+          }
+          return true;
+        }
+        wrap_reader->Feed(data, size);
+        return !stopped;
+      }) {
+  if (unwrap) {
+    wrap_reader = make_uniq<GssWrapBlockReader>(
+        [this](const std::string &data, const std::string &token) {
+          if (stopped) {
+            return;
+          }
+          auto plain = unwrap(data, token);
+          plain_bytes += plain.size();
+          if (on_plain && !plain.empty() &&
+              !on_plain(const_data_ptr_cast(plain.data()), plain.size())) {
+            stopped = true;
+          }
+        });
+  }
+}
+
+idx_t XmlaTcpResponseReader::Feed(const_data_ptr_t data, idx_t size) {
+  return dime.Feed(data, size);
+}
+
+void XmlaTcpResponseReader::Finish() const {
+  if (wrap_reader && !stopped) {
+    wrap_reader->Finish();
+  }
+}
+
+uint8_t XmlaTcpCapsForTransport(bool response_sx, bool response_xpress) {
+  uint8_t flags = XMLA_TCP_CAPS_NEGO;
+  if (response_sx) {
+    flags |= XMLA_TCP_CAPS_RESP_SX;
+  }
+  if (response_xpress) {
+    flags |= XMLA_TCP_CAPS_RESP_XPRESS;
+  }
+  return flags;
+}
+
 std::string BuildXmlaAuthenticateEnvelope(const std::string &sspi_token) {
   std::string envelope =
       "<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body>"

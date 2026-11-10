@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 
 #include <cstdint>
@@ -108,6 +109,45 @@ private:
   BlockCallback on_block;
   std::string buffer;
 };
+
+//! Reads one response message from the socket byte stream: DIME records, and
+//! when GSS-API protection is active ([MS-SSAS] 2.1.3) the wrap blocks inside
+//! them. Plaintext is forwarded to on_plain as soon as each block (or record
+//! chunk, when unprotected) is complete, so large results stream.
+class XmlaTcpResponseReader {
+public:
+  using Unwrap = std::function<std::string(const std::string &data,
+                                           const std::string &token)>;
+  using DataCallback = std::function<bool(const_data_ptr_t, idx_t)>;
+
+  //! unwrap may be empty for an unprotected connection.
+  XmlaTcpResponseReader(Unwrap unwrap, DataCallback on_plain);
+
+  //! Returns the number of bytes consumed; stops at the end of the message or
+  //! when on_plain returns false.
+  idx_t Feed(const_data_ptr_t data, idx_t size);
+  //! Throws IOException when a protected message ends mid-block.
+  void Finish() const;
+  bool MessageComplete() const { return dime.MessageComplete(); }
+  bool Stopped() const { return stopped; }
+  const std::string &ContentType() const { return dime.ContentType(); }
+  uint8_t CapsFlags() const { return dime.CapsFlags(); }
+  bool HasCapsFlags() const { return dime.HasCapsFlags(); }
+  idx_t RecordCount() const { return dime.RecordCount(); }
+  idx_t PlainBytes() const { return plain_bytes; }
+
+private:
+  Unwrap unwrap;
+  DataCallback on_plain;
+  bool stopped = false;
+  idx_t plain_bytes = 0;
+  unique_ptr<GssWrapBlockReader> wrap_reader;
+  DimeMessageReader dime;
+};
+
+//! [MS-SSAS] 2.1.1 OPTIONS flags for an XMLA transport mode: requests stay
+//! text XML, responses use binary XML and/or compression as requested.
+uint8_t XmlaTcpCapsForTransport(bool response_sx, bool response_xpress);
 
 //! [MS-SSAS] 3.1.4.1.2.1 Authenticate request carrying a base64 SSPI token.
 std::string BuildXmlaAuthenticateEnvelope(const std::string &sspi_token);

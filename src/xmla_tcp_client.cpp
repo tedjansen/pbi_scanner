@@ -6,7 +6,9 @@
 #include "duckdb/common/string_util.hpp"
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
+#include <functional>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -128,46 +130,6 @@ struct LocalXmlaTcpClient::Impl {
     }
   }
 
-  std::string ReceiveDimeMessage(LocalXmlaResponse &response) {
-    std::string raw;
-    DimeMessageReader reader([&](const_data_ptr_t data, idx_t size) {
-      raw.append(reinterpret_cast<const char *>(data), size);
-      return true;
-    });
-    char buffer[64 * 1024];
-    while (!reader.MessageComplete()) {
-      auto received = recv(socket_handle, buffer, sizeof(buffer), 0);
-      if (received == 0) {
-        throw IOException("Local XMLA server closed the TCP connection after "
-                          "%llu bytes",
-                          static_cast<unsigned long long>(response.wire_bytes));
-      }
-      if (received == SOCKET_ERROR) {
-        auto error = WSAGetLastError();
-        if (error == WSAETIMEDOUT) {
-          throw IOException("Local XMLA TCP receive timed out after %lld ms",
-                            static_cast<long long>(timeout_ms));
-        }
-        throw IOException("Local XMLA TCP receive failed (WSA error %d)",
-                          error);
-      }
-      response.wire_bytes += static_cast<idx_t>(received);
-      auto consumed = reader.Feed(const_data_ptr_cast(buffer),
-                                  static_cast<idx_t>(received));
-      if (consumed < static_cast<idx_t>(received)) {
-        // A request/response protocol: nothing may follow the response.
-        throw IOException("Local XMLA server sent %llu unexpected bytes after "
-                          "the DIME response message",
-                          static_cast<unsigned long long>(received - consumed));
-      }
-    }
-    response.content_type = reader.ContentType();
-    response.caps_flags = reader.CapsFlags();
-    response.has_caps_flags = reader.HasCapsFlags();
-    response.dime_records = reader.RecordCount();
-    return raw;
-  }
-
   std::string Wrap(const std::string &plain) {
     std::string out;
     static constexpr idx_t BLOCK = 32 * 1024;
@@ -212,43 +174,42 @@ struct LocalXmlaTcpClient::Impl {
     return out;
   }
 
-  std::string Unwrap(const std::string &wrapped) {
-    std::string plain;
-    GssWrapBlockReader reader(
-        [&](const std::string &data_p, const std::string &token_p) {
-          auto data = data_p;
-          auto token = token_p;
-          SecBuffer buffers[2];
-          buffers[0].BufferType = SECBUFFER_DATA;
-          buffers[0].cbBuffer = static_cast<unsigned long>(data.size());
-          buffers[0].pvBuffer = data.empty() ? nullptr : &data[0];
-          buffers[1].BufferType = SECBUFFER_TOKEN;
-          buffers[1].cbBuffer = static_cast<unsigned long>(token.size());
-          buffers[1].pvBuffer = token.empty() ? nullptr : &token[0];
-          SecBufferDesc desc;
-          desc.ulVersion = SECBUFFER_VERSION;
-          desc.cBuffers = 2;
-          desc.pBuffers = buffers;
-          unsigned long qop = 0;
-          auto status = encrypt_messages
-                            ? DecryptMessage(&context, &desc, 0, &qop)
-                            : VerifySignature(&context, &desc, 0, &qop);
-          if (status != SEC_E_OK) {
-            throw IOException("SSPI %s failed with %s",
-                              encrypt_messages ? "DecryptMessage"
-                                               : "VerifySignature",
-                              SecurityStatusText(status).c_str());
-          }
-          plain.append(static_cast<const char *>(buffers[0].pvBuffer),
+  std::string UnwrapBlock(const std::string &data_p,
+                          const std::string &token_p) {
+    auto data = data_p;
+    auto token = token_p;
+    SecBuffer buffers[2];
+    buffers[0].BufferType = SECBUFFER_DATA;
+    buffers[0].cbBuffer = static_cast<unsigned long>(data.size());
+    buffers[0].pvBuffer = data.empty() ? nullptr : &data[0];
+    buffers[1].BufferType = SECBUFFER_TOKEN;
+    buffers[1].cbBuffer = static_cast<unsigned long>(token.size());
+    buffers[1].pvBuffer = token.empty() ? nullptr : &token[0];
+    SecBufferDesc desc;
+    desc.ulVersion = SECBUFFER_VERSION;
+    desc.cBuffers = 2;
+    desc.pBuffers = buffers;
+    unsigned long qop = 0;
+    auto status = encrypt_messages ? DecryptMessage(&context, &desc, 0, &qop)
+                                   : VerifySignature(&context, &desc, 0, &qop);
+    if (status != SEC_E_OK) {
+      throw IOException("SSPI %s failed with %s",
+                        encrypt_messages ? "DecryptMessage" : "VerifySignature",
+                        SecurityStatusText(status).c_str());
+    }
+    return std::string(static_cast<const char *>(buffers[0].pvBuffer),
                        buffers[0].cbBuffer);
-        });
-    reader.Feed(const_data_ptr_cast(wrapped.data()), wrapped.size());
-    reader.Finish();
-    return plain;
   }
 
-  LocalXmlaResponse RoundTrip(const std::string &envelope, uint8_t caps_flags,
-                              bool allow_wrap) {
+  LocalXmlaResponse
+  RoundTripStream(const std::string &envelope, uint8_t caps_flags,
+                  bool allow_wrap,
+                  const std::function<bool(const_data_ptr_t, idx_t)> &on_data,
+                  bool &stopped_out) {
+    stopped_out = false;
+    if (socket_handle == INVALID_SOCKET) {
+      throw IOException("Local XMLA TCP client is not connected");
+    }
     auto wrap = allow_wrap && wrap_messages;
     auto payload = wrap ? Wrap(envelope) : envelope;
     auto message = EncodeDimeMessage("text/xml", caps_flags, payload);
@@ -258,20 +219,120 @@ struct LocalXmlaTcpClient::Impl {
                    HexPreview(message, 96).c_str());
     }
     SendAll(message);
+
     LocalXmlaResponse response;
-    auto raw = ReceiveDimeMessage(response);
+    FILE *dump = OpenDumpFile();
+    std::string preview;
+    XmlaTcpResponseReader reader(
+        wrap ? XmlaTcpResponseReader::Unwrap(
+                   [this](const std::string &data, const std::string &token) {
+                     return UnwrapBlock(data, token);
+                   })
+             : XmlaTcpResponseReader::Unwrap(),
+        [&](const_data_ptr_t data, idx_t size) {
+          if (preview.size() < 96) {
+            preview.append(reinterpret_cast<const char *>(data),
+                           std::min<idx_t>(size, 96 - preview.size()));
+          }
+          if (dump) {
+            std::fwrite(data, 1, size, dump);
+          }
+          return on_data ? on_data(data, size) : true;
+        });
+    char buffer[64 * 1024];
+    try {
+      while (!reader.MessageComplete() && !reader.Stopped()) {
+        auto received = recv(socket_handle, buffer, sizeof(buffer), 0);
+        if (received == 0) {
+          throw IOException(
+              "Local XMLA server closed the TCP connection after %llu bytes",
+              static_cast<unsigned long long>(response.wire_bytes));
+        }
+        if (received == SOCKET_ERROR) {
+          auto error = WSAGetLastError();
+          if (error == WSAETIMEDOUT) {
+            throw IOException("Local XMLA TCP receive timed out after %lld ms",
+                              static_cast<long long>(timeout_ms));
+          }
+          if (error == WSAECONNRESET) {
+            throw IOException(
+                "Local XMLA server reset the TCP connection (WSA error %d). "
+                "Power BI Desktop requires an encrypted (privacy) connection",
+                error);
+          }
+          throw IOException("Local XMLA TCP receive failed (WSA error %d)",
+                            error);
+        }
+        response.wire_bytes += static_cast<idx_t>(received);
+        auto consumed = reader.Feed(const_data_ptr_cast(buffer),
+                                    static_cast<idx_t>(received));
+        if (reader.MessageComplete() &&
+            consumed < static_cast<idx_t>(received)) {
+          // A request/response protocol: nothing may follow the response.
+          throw IOException(
+              "Local XMLA server sent %llu unexpected bytes after the DIME "
+              "response message",
+              static_cast<unsigned long long>(received - consumed));
+        }
+      }
+      if (!reader.Stopped()) {
+        reader.Finish();
+      }
+    } catch (...) {
+      if (dump) {
+        std::fclose(dump);
+      }
+      throw;
+    }
+    if (dump) {
+      std::fclose(dump);
+    }
+    stopped_out = reader.Stopped();
+    response.content_type = reader.ContentType();
+    response.caps_flags = reader.CapsFlags();
+    response.has_caps_flags = reader.HasCapsFlags();
+    response.dime_records = reader.RecordCount();
     if (LocalTraceToStderr()) {
       std::fprintf(stderr,
                    "[pbi_scanner local] recv type=%s caps=%s records=%llu "
-                   "data=%llu: %s\n",
+                   "wire=%llu plain=%llu: %s\n",
                    response.content_type.c_str(),
                    DescribeXmlaTcpCapsFlags(response.caps_flags).c_str(),
                    static_cast<unsigned long long>(response.dime_records),
-                   static_cast<unsigned long long>(raw.size()),
-                   HexPreview(raw, 96).c_str());
+                   static_cast<unsigned long long>(response.wire_bytes),
+                   static_cast<unsigned long long>(reader.PlainBytes()),
+                   HexPreview(preview, 96).c_str());
     }
-    response.body = wrap ? Unwrap(raw) : std::move(raw);
     return response;
+  }
+
+  LocalXmlaResponse RoundTrip(const std::string &envelope, uint8_t caps_flags,
+                              bool allow_wrap) {
+    std::string body;
+    bool stopped = false;
+    auto response = RoundTripStream(
+        envelope, caps_flags, allow_wrap,
+        [&](const_data_ptr_t data, idx_t size) {
+          body.append(reinterpret_cast<const char *>(data), size);
+          return true;
+        },
+        stopped);
+    response.body = std::move(body);
+    return response;
+  }
+
+  //! PBI_SCANNER_LOCAL_DUMP_DIR=<folder> writes every decrypted response body
+  //! to <folder>/pbi_local_<n>.bin, for building offline test fixtures.
+  FILE *OpenDumpFile() {
+    auto *dir = std::getenv("PBI_SCANNER_LOCAL_DUMP_DIR");
+    if (!dir || !*dir) {
+      return nullptr;
+    }
+    static std::atomic<unsigned long long> counter{0};
+    auto path = std::string(dir) + "\\pbi_local_" +
+                std::to_string(GetCurrentProcessId()) + "_" +
+                std::to_string(++counter) + ".bin";
+    return std::fopen(path.c_str(), "wb");
   }
 
   void Close() {
@@ -530,6 +591,26 @@ LocalXmlaResponse LocalXmlaTcpClient::RoundTrip(const std::string &envelope,
   return impl->RoundTrip(envelope, caps_flags, true);
 }
 
+LocalXmlaResponse LocalXmlaTcpClient::RoundTripStream(
+    const std::string &envelope, uint8_t caps_flags,
+    const std::function<bool(const_data_ptr_t, idx_t)> &on_data,
+    bool &stopped_out) {
+  return impl->RoundTripStream(envelope, caps_flags, true, on_data,
+                               stopped_out);
+}
+
+bool LocalXmlaTcpClient::IsConnected() const {
+  return impl->socket_handle != INVALID_SOCKET && impl->has_context;
+}
+
+void LocalXmlaTcpClient::Abort() {
+  auto handle = impl->socket_handle;
+  if (handle != INVALID_SOCKET) {
+    // Unblocks a recv() on the worker thread; Close() releases the socket.
+    shutdown(handle, SD_BOTH);
+  }
+}
+
 void LocalXmlaTcpClient::Close() { impl->Close(); }
 
 #else // !_WIN32
@@ -567,6 +648,21 @@ LocalXmlaResponse LocalXmlaTcpClient::RoundTrip(const std::string &envelope,
   (void)caps_flags;
   throw InvalidInputException("%s", LOCAL_XMLA_UNSUPPORTED_MESSAGE);
 }
+
+LocalXmlaResponse LocalXmlaTcpClient::RoundTripStream(
+    const std::string &envelope, uint8_t caps_flags,
+    const std::function<bool(const_data_ptr_t, idx_t)> &on_data,
+    bool &stopped_out) {
+  (void)envelope;
+  (void)caps_flags;
+  (void)on_data;
+  stopped_out = false;
+  throw InvalidInputException("%s", LOCAL_XMLA_UNSUPPORTED_MESSAGE);
+}
+
+bool LocalXmlaTcpClient::IsConnected() const { return false; }
+
+void LocalXmlaTcpClient::Abort() {}
 
 void LocalXmlaTcpClient::Close() {}
 

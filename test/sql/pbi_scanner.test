@@ -318,3 +318,23 @@ statement error
 SELECT * FROM pbi_local_instances(timeout_ms := 0);
 ----
 timeout_ms must be greater than zero
+
+statement error
+SELECT * FROM dax_query('Data Source=localhost:60790;', 'EVALUATE ROW("x", 1)', access_token := 'token');
+----
+access_token is not supported for local Power BI Desktop connections (Data Source=localhost:<port>); they use the current Windows user
+
+statement error
+SELECT * FROM pbi_tables('Data Source=localhost:60790;', auth_mode := 'azure_cli');
+----
+auth_mode is not supported for local Power BI Desktop connections (Data Source=localhost:<port>); they use the current Windows user
+
+statement error
+SELECT * FROM dax_query('Data Source=localhost:60790;Secret=my_secret;', 'EVALUATE ROW("x", 1)');
+----
+Secret is not supported for local Power BI Desktop connections (Data Source=localhost:<port>); they use the current Windows user
+
+statement error
+SELECT * FROM dax_query('Data Source=localhost;', 'EVALUATE ROW("x", 1)');
+----
+Local Data Source must be localhost:<port> with a port between 1 and 65535

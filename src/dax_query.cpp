@@ -47,7 +47,8 @@ struct DaxQueryBindData : public TableFunctionData {
                    string xmla_catalog_p, string xmla_auth_scheme_p,
                    string access_token_p, string power_bi_aad_token_p,
                    string effective_user_name_p, int64_t timeout_ms_p,
-                   std::shared_ptr<HttpClient> xmla_http_client_p = nullptr)
+                   std::shared_ptr<HttpClient> xmla_http_client_p = nullptr,
+                   std::shared_ptr<LocalXmlaTcpClient> local_client_p = nullptr)
       : config(std::move(config_p)), target(std::move(target_p)),
         columns(std::move(columns_p)), dax_text(std::move(dax_text_p)),
         xmla_catalog(std::move(xmla_catalog_p)),
@@ -56,7 +57,8 @@ struct DaxQueryBindData : public TableFunctionData {
         power_bi_aad_token(std::move(power_bi_aad_token_p)),
         effective_user_name(std::move(effective_user_name_p)),
         timeout_ms(timeout_ms_p),
-        xmla_http_client(std::move(xmla_http_client_p)) {}
+        xmla_http_client(std::move(xmla_http_client_p)),
+        local_client(std::move(local_client_p)) {}
 
   unique_ptr<FunctionData> Copy() const override {
     return make_uniq<DaxQueryBindData>(*this);
@@ -90,6 +92,9 @@ struct DaxQueryBindData : public TableFunctionData {
   int64_t timeout_ms;
   //! Populated when ProbeSchema ran; reused for execute on same TCP connection.
   std::shared_ptr<HttpClient> xmla_http_client;
+  //! Local targets: the authenticated TCP connection from the bind-time
+  //! schema probe, reused for execution.
+  std::shared_ptr<LocalXmlaTcpClient> local_client;
 };
 
 struct DaxQueryGlobalState : public GlobalTableFunctionState {
@@ -109,12 +114,13 @@ struct DaxQueryGlobalState : public GlobalTableFunctionState {
     request.statement = bind_data.dax_text;
     request.effective_user_name = bind_data.effective_user_name;
     request.timeout_ms = bind_data.timeout_ms;
-    if (bind_data.xmla_http_client) {
-      executor = make_uniq<XmlaExecutor>(bind_data.timeout_ms,
-                                         bind_data.xmla_http_client);
-    } else {
-      executor = make_uniq<XmlaExecutor>(bind_data.timeout_ms);
+    if (bind_data.config.is_local_instance) {
+      request.local_host = bind_data.config.local_host;
+      request.local_port = bind_data.config.local_port;
     }
+    executor = make_uniq<XmlaExecutor>(bind_data.timeout_ms,
+                                       bind_data.xmla_http_client,
+                                       bind_data.local_client);
 #if PBI_SUPPORTS_BACKGROUND_THREADS
     worker = std::thread([this]() { RunWorker(); });
 #endif
@@ -209,6 +215,19 @@ struct DaxQueryGlobalState : public GlobalTableFunctionState {
   bool execute_started = false;
 
 private:
+  void InvalidateBindCaches() {
+    // Local targets are never cached: the port changes on every Desktop start
+    // and the model changes while it is being developed.
+    if (bind_config.is_local_instance) {
+      return;
+    }
+    InvalidateCachedSchema(bind_target, request.statement,
+                           request.effective_user_name);
+    if (!bind_config.is_direct_xmla) {
+      InvalidateCachedTarget(bind_config);
+    }
+  }
+
   unique_ptr<DataChunk> CreateChunk() const {
     auto chunk = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::DefaultAllocator(), column_types,
@@ -348,28 +367,16 @@ private:
             std::lock_guard<std::mutex> guard(lock);
             error = retry_ex.what();
           }
-          InvalidateCachedSchema(bind_target, request.statement,
-                                 request.effective_user_name);
-          if (!bind_config.is_direct_xmla) {
-            InvalidateCachedTarget(bind_config);
-          }
+          InvalidateBindCaches();
           finish_worker = true;
           continue;
         }
-        InvalidateCachedSchema(bind_target, request.statement,
-                               request.effective_user_name);
-        if (!bind_config.is_direct_xmla) {
-          InvalidateCachedTarget(bind_config);
-        }
+        InvalidateBindCaches();
         std::lock_guard<std::mutex> guard(lock);
         error = ex.what();
         finish_worker = true;
       } catch (const std::exception &ex) {
-        InvalidateCachedSchema(bind_target, request.statement,
-                               request.effective_user_name);
-        if (!bind_config.is_direct_xmla) {
-          InvalidateCachedTarget(bind_config);
-        }
+        InvalidateBindCaches();
         std::lock_guard<std::mutex> guard(lock);
         error = ex.what();
         finish_worker = true;
@@ -555,6 +562,60 @@ static bool TryRecoverFromProbeFailure(
   return true;
 }
 
+//! Local Power BI Desktop targets always authenticate as the current Windows
+//! user over SSPI, so token and secret inputs are rejected rather than
+//! silently ignored.
+static void
+ValidateLocalInstanceTarget(const PowerBIConnectionConfig &config,
+                            const named_parameter_map_t &named_parameters) {
+  static constexpr const char *UNSUPPORTED_PARAMETERS[] = {
+      "auth_mode", "access_token", "secret_name",
+      "tenant_id", "client_id",    "client_secret"};
+  for (auto *name : UNSUPPORTED_PARAMETERS) {
+    if (HasNonNullNamedParameter(named_parameters, name)) {
+      throw InvalidInputException(
+          "%s is not supported for local Power BI Desktop connections "
+          "(Data Source=localhost:<port>); they use the current Windows user",
+          name);
+    }
+  }
+  if (!Trimmed(config.secret_name).empty()) {
+    throw InvalidInputException(
+        "Secret is not supported for local Power BI Desktop connections "
+        "(Data Source=localhost:<port>); they use the current Windows user");
+  }
+  if (!LocalXmlaTcpClient::IsSupported()) {
+    throw InvalidInputException(
+        "Local Power BI Desktop connections (Data Source=localhost:<port>) are "
+        "only supported in native Windows builds of pbi_scanner");
+  }
+}
+
+static string DiscoverLocalCatalog(const PowerBIConnectionConfig &config,
+                                   int64_t timeout_ms,
+                                   std::shared_ptr<LocalXmlaTcpClient> client) {
+  XmlaExecutor executor(timeout_ms, nullptr, std::move(client));
+  XmlaRequest request;
+  request.local_host = config.local_host;
+  request.local_port = config.local_port;
+  request.timeout_ms = timeout_ms;
+  auto names = executor.DiscoverLocalCatalogs(request);
+  if (names.empty()) {
+    throw IOException("Local Analysis Services instance at localhost:%d has no "
+                      "database. Is a model open in Power BI Desktop?",
+                      static_cast<int>(config.local_port));
+  }
+  if (names.size() > 1) {
+    throw InvalidInputException(
+        "Local Analysis Services instance at localhost:%d hosts %llu databases "
+        "(%s); set Initial Catalog to choose one",
+        static_cast<int>(config.local_port),
+        static_cast<unsigned long long>(names.size()),
+        StringUtil::Join(names, ", "));
+  }
+  return names[0];
+}
+
 static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
                                              TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types,
@@ -572,7 +633,11 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
       pbi_compat::CopyBindNamedParameters(input.named_parameters);
 
   auto config = ParsePowerBIConnectionString(connection_string);
-  if (PbiIsBrowserPlatform() && !config.is_direct_xmla) {
+  if (config.is_local_instance) {
+    ValidateLocalInstanceTarget(config, named_parameters);
+  }
+  if (PbiIsBrowserPlatform() && !config.is_direct_xmla &&
+      !config.is_local_instance) {
     throw InvalidInputException(
         "powerbi:// locators are not supported directly in DuckDB-Wasm because "
         "Power BI REST calls require CORS or a backend proxy; use a direct "
@@ -586,8 +651,11 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
 
   auto bind_start = std::chrono::steady_clock::now();
   auto access_token_start = std::chrono::steady_clock::now();
-  auto power_bi_aad_token =
-      ResolvePowerBIAccessToken(context, config, named_parameters);
+  string power_bi_aad_token;
+  if (!config.is_local_instance) {
+    power_bi_aad_token =
+        ResolvePowerBIAccessToken(context, config, named_parameters);
+  }
   DebugTiming("ResolvePowerBIAccessToken", access_token_start);
   auto effective_user_name = ResolveEffectiveUserName(config, named_parameters);
   auto timeout_ms = ResolveTimeoutMs(config, named_parameters);
@@ -597,7 +665,19 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
   string xmla_catalog;
   string xmla_auth_scheme = "Bearer";
   string xmla_access_token = power_bi_aad_token;
-  if (config.is_direct_xmla) {
+  std::shared_ptr<LocalXmlaTcpClient> local_client;
+  if (config.is_local_instance) {
+    target.aixl_url =
+        StringUtil::Format("localhost:%d", static_cast<int>(config.local_port));
+    local_client = std::make_shared<LocalXmlaTcpClient>(timeout_ms, nullptr);
+    xmla_catalog = Trimmed(config.initial_catalog);
+    if (xmla_catalog.empty()) {
+      auto discover_start = std::chrono::steady_clock::now();
+      xmla_catalog = DiscoverLocalCatalog(config, timeout_ms, local_client);
+      DebugTiming("DiscoverLocalCatalog", discover_start);
+    }
+    target.internal_catalog = xmla_catalog;
+  } else if (config.is_direct_xmla) {
     target.aixl_url = config.data_source;
     target.internal_catalog = config.initial_catalog;
   } else {
@@ -619,7 +699,8 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
 
   std::shared_ptr<HttpClient> xmla_http_client;
   std::vector<XmlaColumn> columns;
-  if (!TryGetCachedSchema(target, dax_text, effective_user_name, columns)) {
+  if (config.is_local_instance ||
+      !TryGetCachedSchema(target, dax_text, effective_user_name, columns)) {
     auto full_probe_statement = dax_text;
     auto limited_probe_statement =
         BuildLimitedDaxSchemaProbe(dax_text, schema_probe_rows);
@@ -627,8 +708,12 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
         limited_probe_statement != full_probe_statement;
     auto probe_schema = [&](const string &probe_statement) {
       xmla_http_client = std::make_shared<HttpClient>(timeout_ms);
-      XmlaExecutor executor(timeout_ms, xmla_http_client);
+      XmlaExecutor executor(timeout_ms, xmla_http_client, local_client);
       XmlaRequest request;
+      if (config.is_local_instance) {
+        request.local_host = config.local_host;
+        request.local_port = config.local_port;
+      }
       request.url = target.aixl_url;
       request.catalog = xmla_catalog;
       request.auth_scheme = xmla_auth_scheme;
@@ -686,7 +771,9 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
         throw;
       }
     }
-    StoreCachedSchema(target, dax_text, effective_user_name, columns);
+    if (!config.is_local_instance) {
+      StoreCachedSchema(target, dax_text, effective_user_name, columns);
+    }
   }
   DebugTiming("DaxQueryBind total", bind_start);
   if (columns.empty()) {
@@ -715,7 +802,8 @@ static unique_ptr<FunctionData> DaxQueryBind(ClientContext &context,
       std::move(config), std::move(target), std::move(columns),
       std::move(dax_text), std::move(xmla_catalog), std::move(xmla_auth_scheme),
       std::move(xmla_access_token), std::move(power_bi_aad_token),
-      std::move(effective_user_name), timeout_ms, std::move(xmla_http_client));
+      std::move(effective_user_name), timeout_ms, std::move(xmla_http_client),
+      std::move(local_client));
 }
 
 static unique_ptr<GlobalTableFunctionState>

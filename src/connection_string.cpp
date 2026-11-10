@@ -1,5 +1,6 @@
 #include "connection_string.hpp"
 #include "pbi_scanner_util.hpp"
+#include "xmla_tcp.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -179,6 +180,13 @@ PowerBIConnectionConfig ParsePowerBIConnectionString(const std::string &raw) {
 
   if (Trimmed(result.data_source).empty()) {
     throw InvalidInputException("Data Source is required");
+  }
+  if (TryParseLocalInstanceDataSource(result.data_source, result.local_host,
+                                      result.local_port)) {
+    // Power BI Desktop hosts a single database whose name is a GUID; it is
+    // discovered at bind time when Initial Catalog is omitted.
+    result.is_local_instance = true;
+    return result;
   }
   if (Trimmed(result.initial_catalog).empty()) {
     throw InvalidInputException("Initial Catalog is required");
