@@ -1,9 +1,11 @@
 # Local Power BI Desktop (Windows): design notes
 
-Status: **spike**. The wire codec is implemented and covered by offline tests.
-The Windows socket/SSPI client and the `pbi_local_probe` diagnostic function
-are in place. `dax_query` and the `pbi_*` metadata functions do not accept
-local targets yet. See "Next steps" below.
+Status: **implemented, awaiting Windows validation**. `dax_query` and the
+`pbi_*` metadata functions accept `Data Source=localhost:<port>`. Discovery
+(`pbi_local_instances`) and diagnostics (`pbi_local_probe`) are available. The
+handshake, encryption and decoding were verified against Power BI Desktop with
+the probe. The full `dax_query` path still needs the Windows smoke test in
+[local_desktop_smoke.md](local_desktop_smoke.md), step 4.
 
 Tracking issue: crazy-treyn/pbi_scanner#19.
 
@@ -160,37 +162,55 @@ These come from Power BI Desktop, Microsoft Store install:
    heuristics right for the installed Desktop version and language? This
    covers unsaved reports ("Untitled") and the Microsoft Store install.
 
-## Planned public surface
+## Public surface
 
 - `Data Source=localhost:<port>` (also `127.0.0.1:<port>`, `[::1]:<port>`),
   with no scheme. `Initial Catalog` is optional for local targets. When it is
-  omitted, the extension discovers it through `DBSCHEMA_CATALOGS`.
+  omitted, the extension discovers it through `DBSCHEMA_CATALOGS`; if there
+  is more than one database, it asks for `Initial Catalog`.
 - No token resolution for local targets. Authentication is always the current
-  Windows user. `auth_mode`, `access_token`, `secret_name` and the service
-  principal parameters are rejected for local targets.
-- Same column naming (`normalize_dax_column_names`) and type coercion as the
-  service path, because the same parsers are used.
+  Windows user (SSPI Negotiate, which is NTLM on loopback), with an encrypted
+  session. `auth_mode`, `access_token`, `secret_name`, `tenant_id`,
+  `client_id`, `client_secret` and `Secret=` are rejected with
+  `<name> is not supported for local Power BI Desktop connections ...`.
+- Same column naming (`normalize_dax_column_names`), schema probe, transports
+  (`PBI_SCANNER_XMLA_TRANSPORT`) and type coercion as the service path,
+  because the same parsers are used.
 - Local targets are not stored in the metadata cache: the port changes on
-  every Desktop start.
+  every Desktop start, and the model changes while it is being developed.
 - Clear `InvalidInputException` on non-Windows and WASM builds:
   `Local Power BI Desktop connections (Data Source=localhost:<port>) are only
   supported in native Windows builds of pbi_scanner`.
+- `PBI_SCANNER_LOCAL_TRACE=1` traces each message on stderr.
+  `PBI_SCANNER_LOCAL_DUMP_DIR=<folder>` writes decrypted response bodies to
+  files, for offline fixtures.
 
-## Next steps (after the probe results)
+## Implementation
 
-1. Add a `localhost:<port>` target kind to `PowerBIConnectionConfig` and make
-   `Initial Catalog` optional for it.
-2. Introduce a small channel abstraction in `XmlaExecutor`, so that
-   `ProbeSchema` and `ExecuteStreaming` can run over either `HttpClient` or
-   `LocalXmlaTcpClient`. The TCP channel reports the DIME TYPE as the content
-   type and streams the record data into the existing decoders.
-3. Branch in `src/dax_query.cpp` bind/execute: skip the resolver, token
-   resolution and the metadata cache for local targets.
-4. sqllogictest coverage for accepted and rejected connection strings, plus a
-   Catch test that feeds a synthetic DIME `sx+xpress` response through the
-   channel.
-5. Decide whether to keep `pbi_local_probe` as a documented diagnostic or
-   remove it.
+- `PowerBIConnectionConfig::is_local_instance` with `local_host` and
+  `local_port`, set by `ParsePowerBIConnectionString`.
+- `XmlaExecutor::PostXmla` sends HTTP requests through `HttpClient` and local
+  requests through `LocalXmlaTcpClient::RoundTripStream`. For local requests,
+  the DIME TYPE becomes the response `Content-Type`, so `ProbeSchema`,
+  `ExecuteStreaming` and every decoder are unchanged. Transport errors become
+  `request failed` errors, exactly as on HTTP.
+- `XmlaTcpResponseReader` (portable, unit tested) decrypts wrap blocks as DIME
+  records arrive, so results stream instead of being buffered.
+- `dax_query` bind skips the resolver, token resolution and caches for local
+  targets. It discovers the catalog when needed, and hands the authenticated
+  connection from the schema probe to execution. Cancellation shuts the
+  socket down (`LocalXmlaTcpClient::Abort`).
+
+## Next steps
+
+1. Windows smoke test (step 4 of the smoke doc). Compare types and values
+   across the `sx_xpress`, `xpress` and `plain` transports, and against the
+   published model.
+2. If BOOLEAN or other sx tokens decode differently from `xpress`, capture
+   the bodies with `PBI_SCANNER_LOCAL_DUMP_DIR` and turn them into Catch
+   fixtures.
+3. Decide whether to keep `pbi_local_probe` as a documented diagnostic.
+4. Upstream PR (crazy-treyn/pbi_scanner#19), once the maintainer agrees.
 
 ## Out of scope (follow-ups)
 

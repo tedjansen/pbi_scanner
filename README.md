@@ -485,24 +485,39 @@ vcpkg checkout.
 
 ### Local Power BI Desktop (Windows, experimental)
 
-Work in progress: running DAX against a model open in Power BI Desktop. Desktop
-hosts the model in a local Analysis Services instance on `localhost:<port>`.
-That instance speaks the native Analysis Services TCP protocol with Windows
-authentication, not XMLA over HTTP.
-
-The current build ships two experimental functions, both Windows only:
+`dax_query` and the `pbi_*` metadata functions can query a model that is open
+in Power BI Desktop on the same Windows machine. Desktop hosts the model in a
+local Analysis Services instance on `localhost:<port>`. pbi_scanner talks to it
+over the native Analysis Services TCP protocol ([MS-SSAS]: DIME framing, and
+SSPI/NTLM as the current Windows user with an encrypted session). There is no
+token, secret or extra driver.
 
 ```sql
 -- Open Desktop models: report name, port, catalog and a ready connection string
 SELECT report_name, port, connection_string FROM pbi_local_instances();
--- Handshake diagnostics for one instance
-SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');
+
+-- Initial Catalog is optional; Desktop hosts one database (a GUID)
+SELECT * FROM dax_query('Data Source=localhost:60790;', 'EVALUATE ROW("probe_ok", 1)');
+SELECT * FROM pbi_tables('Data Source=localhost:60790;');
 ```
 
-`dax_query` and the `pbi_*` metadata functions do not accept
-`Data Source=localhost:<port>` yet. On other platforms and in DuckDB-Wasm,
-local targets raise an `InvalidInputException`. For the design, see
-[docs/local_desktop.md](docs/local_desktop.md). To run the probe on Windows,
+Notes:
+
+- The port changes every time Desktop starts. Read it with
+  `pbi_local_instances()` (or from `msmdsrv.port.txt` in the Desktop workspace
+  folder).
+- Column names, types and `normalize_dax_column_names` behave as on the service
+  path, because the same XMLA parsers are used.
+- `auth_mode`, `access_token`, `secret_name`, the service principal parameters
+  and `Secret=` are rejected for local targets. Local targets are never stored
+  in the metadata cache.
+- Other platforms and DuckDB-Wasm raise an `InvalidInputException` for local
+  targets.
+- `pbi_local_probe('Data Source=localhost:<port>;')` reports each handshake
+  step for troubleshooting.
+
+For the design and protocol notes, see
+[docs/local_desktop.md](docs/local_desktop.md). For Windows validation steps,
 see [docs/local_desktop_smoke.md](docs/local_desktop_smoke.md).
 
 ## Troubleshooting

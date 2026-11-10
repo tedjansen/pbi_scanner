@@ -109,29 +109,130 @@ SELECT * FROM pbi_local_probe('Data Source=localhost:<port>;', protection := 'no
 SELECT * FROM pbi_local_probe('Data Source=localhost:<port>;', protection := 'none', dax_text := 'EVALUATE TOPN(5, INFO.VIEW.TABLES())');
 ```
 
-## 4. Full smoke (after `dax_query` supports local targets)
+## 4. Full smoke: `dax_query` and `pbi_*` against Desktop
 
-The connection string can come straight from `pbi_local_instances()`:
-`SELECT connection_string FROM pbi_local_instances() WHERE report_name = 'Sales Model';`.
+Paste these blocks into PowerShell one at a time. The examples use
+`C:\git` and the report `Uren`; adjust both. Queries avoid non-ASCII
+characters, because Windows PowerShell may re-encode piped text.
 
-These checks run once local targets are wired into `dax_query`. They are not
-available in the spike build yet.
+**4a. Setup.** The helper loads the extension and runs SQL through stdin.
 
-```sql
-LOAD '<path>\pbi_scanner.duckdb_extension';
-SELECT * FROM dax_query('Data Source=localhost:<port>;', 'EVALUATE ROW("probe_ok", 1)');
-SELECT * FROM pbi_tables('Data Source=localhost:<port>;');
-SELECT * FROM dax_query('Data Source=localhost:<port>;',
-  'EVALUATE ROW("d", DATE(2024, 1, 31), "c", CURRENCY(12.34), "f", DIVIDE(1, 3), "b", BLANK())');
-DESCRIBE SELECT * FROM dax_query('Data Source=localhost:<port>;',
-  'EVALUATE ROW("d", DATE(2024, 1, 31), "c", CURRENCY(12.34), "f", DIVIDE(1, 3), "b", BLANK())');
+```powershell
+cd C:\git
+$ext = (Resolve-Path .\pbi_scanner.duckdb_extension).Path
+Remove-Item Env:PBI_SCANNER_LOCAL_TRACE, Env:PBI_SCANNER_XMLA_TRANSPORT, Env:PBI_SCANNER_LOCAL_DUMP_DIR -ErrorAction SilentlyContinue
+function Invoke-Duck([string]$sql) { ("LOAD '$ext';`n" + $sql) | .\duckdb.exe -unsigned }
+```
+
+**4b. Discovery.** Expect `catalog` to be filled and `detail` to be empty.
+
+```powershell
+Invoke-Duck @"
+.mode line
+SELECT * FROM pbi_local_instances();
+"@
+$cs = (Invoke-Duck @"
+.mode list
+.headers off
+SELECT connection_string FROM pbi_local_instances() WHERE report_name = 'Uren' LIMIT 1;
+"@ | Select-Object -Last 1).Trim()
+$port = [regex]::Match($cs, 'localhost:(\d+)').Groups[1].Value
+$cs; $port
+```
+
+**4c. First queries.** Run one with the discovered catalog and one without
+`Initial Catalog`.
+
+```powershell
+Invoke-Duck @"
+.mode box
+SELECT * FROM dax_query('$cs', 'EVALUATE ROW("probe_ok", 1)');
+SELECT * FROM dax_query('Data Source=localhost:$port;', 'EVALUATE ROW("probe_ok", 2)');
+"@
+```
+
+**4d. Types and values on every transport.** The rows should be identical.
+
+```powershell
+$typed = 'EVALUATE ROW("i", 42, "c", CURRENCY(12.34), "f", DIVIDE(1, 3), "d", DATE(2024, 1, 31), "dt", DATE(2024, 1, 31) + TIME(13, 45, 0), "s", "h" & UNICHAR(233) & "llo", "t", TRUE(), "fa", FALSE(), "b", BLANK())'
+Invoke-Duck @"
+.mode box
+DESCRIBE SELECT * FROM dax_query('$cs', '$typed');
+"@
+foreach ($t in 'sx_xpress', 'xpress', 'plain') {
+  $env:PBI_SCANNER_XMLA_TRANSPORT = $t
+  Invoke-Duck @"
+.mode line
+SELECT '$t' AS transport, * FROM dax_query('$cs', '$typed');
+"@
+}
+Remove-Item Env:PBI_SCANNER_XMLA_TRANSPORT
+```
+
+**4e. Metadata functions.**
+
+```powershell
+Invoke-Duck @"
+.mode box
+SELECT (SELECT count(*) FROM pbi_tables('$cs')) AS tables,
+       (SELECT count(*) FROM pbi_columns('$cs')) AS columns,
+       (SELECT count(*) FROM pbi_measures('$cs')) AS measures,
+       (SELECT count(*) FROM pbi_relationships('$cs')) AS relationships;
+SELECT * FROM pbi_tables('$cs') LIMIT 5;
+SELECT * FROM pbi_tables('$cs', normalize_dax_column_names := true) LIMIT 3;
+"@
+```
+
+**4f. A real table on every transport.** Expect the same row count everywhere
+and a reasonable time for `sx_xpress`.
+
+```powershell
+$table = 'Medewerkers'
+foreach ($t in 'sx_xpress', 'xpress', 'plain') {
+  $env:PBI_SCANNER_XMLA_TRANSPORT = $t
+  Invoke-Duck @"
+.timer on
+.mode box
+SELECT '$t' AS transport, count(*) AS row_count FROM dax_query('$cs', 'EVALUATE ''$table''');
+"@
+}
+Remove-Item Env:PBI_SCANNER_XMLA_TRANSPORT
+Invoke-Duck @"
+.mode box
+SELECT * FROM dax_query('$cs', 'EVALUATE TOPN(5, ''$table'')');
+"@
+```
+
+**4g. Error messages.** Each statement should fail with a clear message.
+
+```powershell
+Invoke-Duck @"
+SELECT * FROM dax_query('Data Source=localhost:1;', 'EVALUATE ROW("x", 1)');
+SELECT * FROM dax_query('$cs', 'EVALUATE ROW("x", 1)', access_token := 'abc');
+SELECT * FROM dax_query('$cs', 'EVALUATE NOSUCHFUNCTION()');
+"@
+```
+
+**4h. Optional: capture fixtures.** Use this if 4d differs between transports.
+The output is hex for the synthetic `EVALUATE ROW` only, with no model data.
+
+```powershell
+New-Item -ItemType Directory -Force C:\git\pbi_dump | Out-Null
+Remove-Item C:\git\pbi_dump\* -ErrorAction SilentlyContinue
+$env:PBI_SCANNER_LOCAL_DUMP_DIR = 'C:\git\pbi_dump'
+Invoke-Duck "SELECT * FROM dax_query('$cs', '$typed');" | Out-Null
+Remove-Item Env:PBI_SCANNER_LOCAL_DUMP_DIR
+Get-ChildItem C:\git\pbi_dump | ForEach-Object { $_.Name; ([BitConverter]::ToString([IO.File]::ReadAllBytes($_.FullName)) -replace '-', '') }
 ```
 
 Expected results:
 
-- `probe_ok = 1`;
-- `pbi_tables` lists the model's tables;
-- `d` is `DATE` or `TIMESTAMP` as on the service path, `c` is `DECIMAL`/`DOUBLE`
-  as on the service path, and `b` is `NULL`.
-
-Compare the types with the same query against the published model.
+- 4b: `catalog` is the model GUID.
+- 4c: `probe_ok` is 1 and 2; the second query discovers the catalog itself.
+- 4d: `i` BIGINT, `c` and `f` DOUBLE, `d` DATE, `dt` TIMESTAMP, `s` VARCHAR,
+  `t`/`fa` BOOLEAN. An all-`BLANK()` column is left out of the schema by the
+  server. The values match across transports.
+- 4e: counts match what Desktop shows in the model view.
+- 4f: the same row count on all transports.
+- 4g: a connect error, the `access_token is not supported ...` error, and a
+  DAX error from the server.
