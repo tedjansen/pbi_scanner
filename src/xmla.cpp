@@ -1235,7 +1235,9 @@ private:
   static constexpr uint8_t SQL_BIGINT_TOKEN = 0x08;
   static constexpr uint8_t SQL_NCHAR_TOKEN = 0x0E;
   static constexpr uint8_t SQL_NVARCHAR_TOKEN = 0x11;
-  static constexpr uint8_t EMPTY_TEXT_TOKEN = 0x86;
+  //! [MS-BINXML] XSD-BOOLEAN: one value byte follows (0 = false, 1 = true).
+  //! Analysis Services uses it for DAX TRUE()/FALSE() and boolean columns.
+  static constexpr uint8_t XSD_BOOLEAN_TOKEN = 0x86;
   static constexpr idx_t MEASURE_TRACE_LIMIT = 200;
 
   struct ExpandedName {
@@ -1663,8 +1665,8 @@ private:
     }
     case 0x1B:
       return std::to_string(ReadUInt64());
-    case EMPTY_TEXT_TOKEN:
-      return std::string();
+    case XSD_BOOLEAN_TOKEN:
+      return ReadByte() ? "true" : "false";
     default:
       FailUnsupported(token, offset - 1);
     }
@@ -1777,7 +1779,7 @@ private:
     case 0x19:
     case 0x1A:
     case 0x1B:
-    case EMPTY_TEXT_TOKEN: {
+    case XSD_BOOLEAN_TOKEN: {
       auto cell_name = pending_start ? pending_name : last_started_name;
       FlushPendingStart();
       auto text = ReadTextValue(token);
@@ -1867,7 +1869,9 @@ private:
   static constexpr uint8_t SQL_BIGINT_TOKEN = 0x08;
   static constexpr uint8_t SQL_NCHAR_TOKEN = 0x0E;
   static constexpr uint8_t SQL_NVARCHAR_TOKEN = 0x11;
-  static constexpr uint8_t EMPTY_TEXT_TOKEN = 0x86;
+  //! [MS-BINXML] XSD-BOOLEAN: one value byte follows (0 = false, 1 = true).
+  //! Analysis Services uses it for DAX TRUE()/FALSE() and boolean columns.
+  static constexpr uint8_t XSD_BOOLEAN_TOKEN = 0x86;
   static constexpr idx_t CELL_TRACE_LIMIT = 80;
   static constexpr idx_t STREAMING_CHECKPOINT_THRESHOLD = 512;
 
@@ -2514,8 +2518,8 @@ private:
       return std::to_string(ReadUInt32());
     case 0x1B:
       return std::to_string(ReadUInt64());
-    case EMPTY_TEXT_TOKEN:
-      return std::string();
+    case XSD_BOOLEAN_TOKEN:
+      return ReadByte() ? "true" : "false";
     default:
       FailUnsupported(token, offset - 1);
     }
@@ -2686,8 +2690,19 @@ private:
     case SQL_NCHAR_TOKEN:
     case SQL_NVARCHAR_TOKEN:
       return ValueFromText(ReadInlineUtf16Value(), coercion_kind);
-    case EMPTY_TEXT_TOKEN:
-      return ValueFromText(std::string(), coercion_kind);
+    case XSD_BOOLEAN_TOKEN:
+      if (ReadByte()) {
+        if (coercion_kind == XmlaCoercionKind::BOOLEAN ||
+            coercion_kind == XmlaCoercionKind::INFER) {
+          return Value::BOOLEAN(true);
+        }
+        return ValueFromText("true", coercion_kind);
+      }
+      if (coercion_kind == XmlaCoercionKind::BOOLEAN ||
+          coercion_kind == XmlaCoercionKind::INFER) {
+        return Value::BOOLEAN(false);
+      }
+      return ValueFromText("false", coercion_kind);
     default:
       FailUnsupported(token, offset - 1);
     }
@@ -2819,7 +2834,7 @@ private:
     case 0x19:
     case 0x1A:
     case 0x1B:
-    case EMPTY_TEXT_TOKEN:
+    case XSD_BOOLEAN_TOKEN:
       ParseText(token);
       return;
     default:
@@ -3348,6 +3363,28 @@ XmlaParseTestResult ParseBinXmlForTesting(const std::string &payload,
   if (result.columns.empty() && parser.HasSchema()) {
     result.columns = parser.Columns();
   }
+  if (parser.HasFault()) {
+    result.fault_message = parser.GetFaultMessage();
+  }
+  return result;
+}
+
+XmlaParseTestResult
+ParseBinXmlWithColumnsForTesting(const std::string &payload,
+                                 const std::vector<XmlaColumn> &columns) {
+  // Mirrors ExecuteStreaming for sx responses: the schema comes from the
+  // xpress schema probe, the rows from the binary XML body.
+  XmlaParseTestResult result;
+  XmlaStreamParser parser(
+      false, nullptr,
+      [&](const std::vector<Value> &row) {
+        result.rows.push_back(row);
+        return true;
+      },
+      &columns);
+  ParseBinXmlResponse(payload, parser);
+  parser.Finish();
+  result.columns = columns;
   if (parser.HasFault()) {
     result.fault_message = parser.GetFaultMessage();
   }

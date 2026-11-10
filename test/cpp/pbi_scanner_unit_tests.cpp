@@ -11,6 +11,7 @@
 #include "pbi_scanner_util.hpp"
 #include "xmla.hpp"
 #include "xmla_tcp.hpp"
+#include "xpress.hpp"
 #include "xmla_tcp_client.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -837,3 +838,88 @@ TEST_CASE("dax_query local targets are Windows only", "[local_instances]") {
   }
 }
 #endif
+
+namespace {
+
+// Captured from Power BI Desktop (PBI_SCANNER_LOCAL_DUMP_DIR) for the
+// synthetic query EVALUATE ROW("i", 42, "c", CURRENCY(12.34), "f",
+// DIVIDE(1, 3), "d", DATE(2024, 1, 31), "dt", DATE(2024, 1, 31) + TIME(13, 45,
+// 0), "s", "h" & UNICHAR(233) & "llo", "t", TRUE(), "fa", FALSE(), "b",
+// BLANK()). Both bodies are Xpress-framed: the xpress schema probe (plain
+// XML) and the sx+xpress execution response (binary XML).
+constexpr const char *kDesktopTypedRowXpress =
+    "34030000b9010000000400003c736f61703a456e76656c6f706520786d6c6e733a99003d"
+    "22687474703a2f2f73004482016368656d61732ed000b9002e6f72672f41002f65a4012f"
+    "223e2b02426f64793e3c4578656300402000757465526573706f6e7394023d2275726e3a"
+    "54022d6d6963726f736f66742d636f6d048811403a00012d616e616c7973697350027265"
+    "74580138006f6f74e7010f153a726f7773657422ab013a7805104020736926067777772e"
+    "7733da05323030312f584d4c537a022d696e7374616e6365af0164af011f092540109565"
+    "016d733800617e0173e200732e6d15052e636f6d2ff50473657276696365735902332fc1"
+    "01222907831d1000773e3c5f78303035425f693a00445f3e34323c2f5a009f002501633a"
+    "00800031322e33343e01b60001801db13d01663a008000332e33070014452d31b6012e01"
+    "b501643a008000323032342d30312d33315430303a1200f0c00eeeae012601ae01744200"
+    "8800b70131333a3435b701032e01bd01733a00800068c3a96c6c6f4e01be004501ce0174"
+    "727565ef9b19e63601ae00350166614200880066616c734701bf00503c2f8a0b28006f74"
+    "310064132faf1588009716015b0025193e";
+constexpr const char *kDesktopTypedRowSxXpress =
+    "e40400006a02000000000000dfff01b004fe0331002e003000fd065500540046002d0031"
+    "00360000f02968005411004174080070003a002f080073006300680065006d006158002e"
+    "007848006c48006f78007078006f0000112a1a7200673a018b002f58016e007628006c88"
+    "007038002f00f004ed00f00845ef00f5ef010203f801f00a020005acbb026e38023a1800"
+    "6b01ef000400f6020e8f043c42580064007900ef010205f5f803f02675b0016e82aaaad5"
+    "1003f702f42d380069880072700181026640042d78006fb8003ad4032d48016e18006c70"
+    "027368017300f00f45d800650206a8a23801757801650052180073d0036f3801735800ef"
+    "060007f804f005fb019900ef000800f6050e2f04350603650d5c72080274180499029803"
+    "09f5f806f02d73001703ff2d3a7a017748004103f00469006f4800ef0a000bf80780066f"
+    "0343006a1578093b01f10999011901ef000c00f6088f1196770a002e1800332800fd1032"
+    "e01730a0172f0058004d004c0053d012a8daf8030d052d5802b9027458006eb800656f03"
+    "6468030d00f6090e206f032f27f00cdf026d28007b006108030e00f60a1a7bd7360e370f"
+    "03445f0a2e38005f0a062e7800590a2f08016e18001f0ad9097268188901a114cd043348"
+    "00ad03f002438800180e0f490031a8aaaaaa490010490032490011490033490012490034"
+    "490013490035490014490036490015490037490016490038490017f003400c08a0290577"
+    "590018f5f814f80b082a000300f7f80c0508e201480059000d04550200d53ff7f80e1200"
+    "30103108b1a0000000f7f80f5a00d097e258001011056800e98005b11ef7f8118601f7f8"
+    "128600f7f7ffffff07f7f7f7f7f7";
+
+std::string DecodeHexForDesktopFixture(const std::string &hex) {
+  std::string out;
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    out.push_back(
+        static_cast<char>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+  }
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("Power BI Desktop sx booleans decode with the probed schema",
+          "[xmla]") {
+  auto probe_xml = DecompressXpressLz77Framed(
+      DecodeHexForDesktopFixture(kDesktopTypedRowXpress));
+  auto probe = ParseXmlaChunksForTesting({probe_xml}, true);
+  REQUIRE(probe.fault_message.empty());
+  REQUIRE(probe.columns.size() == 8);
+  REQUIRE(probe.columns[6].name == "[t]");
+  REQUIRE(probe.columns[6].duckdb_type == LogicalType::BOOLEAN);
+  REQUIRE(probe.columns[7].duckdb_type == LogicalType::BOOLEAN);
+
+  auto sx_body = DecompressXpressLz77Framed(
+      DecodeHexForDesktopFixture(kDesktopTypedRowSxXpress));
+  auto rows = ParseBinXmlWithColumnsForTesting(sx_body, probe.columns);
+  REQUIRE(rows.fault_message.empty());
+  REQUIRE(rows.rows.size() == 1);
+  auto &row = rows.rows[0];
+  REQUIRE(row.size() == 8);
+  REQUIRE(row[0] == Value::BIGINT(42));
+  REQUIRE(row[1] == Value::DOUBLE(12.34));
+  REQUIRE(row[4].ToString() == "2024-01-31 13:45:00");
+  REQUIRE(row[5] == Value("h\xc3\xa9llo"));
+  // [MS-BINXML] XSD-BOOLEAN (0x86 + value byte).
+  REQUIRE(row[6] == Value::BOOLEAN(true));
+  REQUIRE(row[7] == Value::BOOLEAN(false));
+
+  // Without a schema the booleans are still inferred as BOOLEAN.
+  auto inferred = ParseBinXmlForTesting(sx_body);
+  REQUIRE(inferred.rows.size() == 1);
+  REQUIRE(inferred.rows[0].back() == Value::BOOLEAN(false));
+}

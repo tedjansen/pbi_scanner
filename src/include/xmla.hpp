@@ -73,6 +73,9 @@ ParseXmlaChunksForTesting(const std::vector<std::string> &chunks,
                           bool stop_after_schema = false);
 XmlaParseTestResult ParseBinXmlForTesting(const std::string &payload,
                                           bool stop_after_schema = false);
+XmlaParseTestResult
+ParseBinXmlWithColumnsForTesting(const std::string &payload,
+                                 const std::vector<XmlaColumn> &columns);
 XmlaParseTestResult ParseStreamingSxRowsForTesting(const std::string &payload,
                                                    idx_t chunk_size);
 Value CoerceXmlValueForTesting(const std::string &raw_value,
