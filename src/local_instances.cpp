@@ -399,7 +399,7 @@ LocalInstancesBind(ClientContext &, TableFunctionBindInput &input,
   int64_t timeout_ms = 10000;
   LocalXmlaAuthOptions auth;
   for (auto &entry : named_parameters) {
-    auto key = StringUtil::Lower(entry.first);
+    auto key = StringUtil::Lower(pbi_compat::IdentifierName(entry.first));
     if (entry.second.IsNull()) {
       continue;
     }

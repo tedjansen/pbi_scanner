@@ -233,7 +233,7 @@ LocalProbeBind(ClientContext &, TableFunctionBindInput &input,
   string dax_text = DEFAULT_PROBE_DAX;
   int64_t timeout_ms = 30000;
   for (auto &entry : named_parameters) {
-    auto key = StringUtil::Lower(entry.first);
+    auto key = StringUtil::Lower(pbi_compat::IdentifierName(entry.first));
     if (entry.second.IsNull()) {
       continue;
     }
