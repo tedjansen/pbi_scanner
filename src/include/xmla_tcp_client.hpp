@@ -14,7 +14,8 @@ struct LocalXmlaAuthOptions {
   //! SSPI package: Negotiate (default), NTLM or Kerberos.
   std::string package = "Negotiate";
   //! none, integrity (signed messages) or privacy (encrypted messages).
-  std::string protection = "none";
+  //! Power BI Desktop resets the connection unless privacy is negotiated.
+  std::string protection = "privacy";
   //! Optional SPN; empty lets SSPI pick (NTLM for loopback).
   std::string target_name;
 };

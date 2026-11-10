@@ -112,6 +112,29 @@ These come from Power BI Desktop, Microsoft Store install:
   ` - Power BI Desktop` suffix. `report_name` now uses the title itself in
   that case.
 
+## Findings from the second Windows run
+
+- **Encryption is required.** With `none` or `integrity`, Desktop resets the
+  connection after the first NTLM round. With `privacy`, the handshake
+  completes in two rounds: NTLM, with `CONFIDENTIALITY|INTEGRITY` and a
+  16-byte trailer. After that, every message is a sequence of wrap blocks as
+  specified in [MS-SSAS] 2.1.3. Our layout (DATA, then TOKEN, sizes
+  little-endian, `SECBUFFER_DATA` + `SECBUFFER_TOKEN`) is accepted in both
+  directions. `privacy` is now the default.
+- Encrypted `DBSCHEMA_CATALOGS` returns the single GUID catalog.
+- A plain-XML `Execute` returns real column names and the expected types.
+  `CURRENCY` comes back as `DOUBLE`, and a column that is entirely `BLANK()`
+  is absent from the schema. Both should be compared with the service path.
+- With `RESP_SX|RESP_XPRESS`, the server answers `application/sx+xpress`.
+  The existing Xpress and binary-XML decoders read it. As on the service path,
+  sx responses carry positional names (`C0`, `C1`, ...), which is why
+  `dax_query` probes the schema with `xpress` first. The probe's stand-alone
+  sx decode misreads the last column after the blank one. The real
+  `dax_query` path decodes sx against the probed schema, so this needs
+  checking once local targets are wired in.
+- Desktop advertises `REQ_SX|REQ_XPRESS` in every response. Requests stay
+  plain text XML.
+
 ## Open questions the Windows probe answers
 
 1. Does Desktop's `msmdsrv` accept requests without `Authenticate` (attempt

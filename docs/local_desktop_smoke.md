@@ -43,7 +43,7 @@ Get-Content instances.csv
 Options:
 
 - `discover_catalog := false` skips the TCP/SSPI lookup.
-- `protection := 'none' | 'integrity' | 'privacy'` sets message protection.
+- `protection := 'privacy'` (default) sets message protection. Desktop rejects `none` and `integrity`.
 - `timeout_ms := 10000` sets the timeout in milliseconds.
 
 Compare the result with what you see. Is every open report listed? Are the
