@@ -282,3 +282,8 @@ statement error
 SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');
 ----
 Local Power BI Desktop connections (Data Source=localhost:<port>) are only supported in native Windows builds of pbi_scanner
+
+statement error
+SELECT * FROM pbi_local_instances();
+----
+pbi_local_instances is only supported in native Windows builds of pbi_scanner

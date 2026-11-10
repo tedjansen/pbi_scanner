@@ -26,8 +26,9 @@ function(target_link_pbi_scanner_deps target)
     target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
     target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
     if(WIN32)
-      # Native Analysis Services TCP transport for local Power BI Desktop.
-      target_link_libraries(${target} ws2_32 secur32)
+      # Native Analysis Services TCP transport and instance discovery for local
+      # Power BI Desktop.
+      target_link_libraries(${target} ws2_32 secur32 iphlpapi user32)
     endif()
     if(ZLIB_FOUND)
       target_compile_definitions(${target} PRIVATE CPPHTTPLIB_ZLIB_SUPPORT)
@@ -60,6 +61,7 @@ set(EXTENSION_SOURCES
     src/xmla_tcp.cpp
     src/xmla_tcp_client.cpp
     src/local_probe.cpp
+    src/local_instances.cpp
 )
 
 list(APPEND EXTENSION_SOURCES src/http_client_common.cpp)

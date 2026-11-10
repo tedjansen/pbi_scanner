@@ -8,5 +8,7 @@ namespace duckdb {
 //! connects to localhost:<port> over the native Analysis Services TCP protocol
 //! and reports every handshake step as a row.
 TableFunction CreatePbiLocalProbeFunction();
+//! Named parameters in catalog (signature) order.
+vector<string> LocalProbeNamedParameterNames();
 
 } // namespace duckdb

@@ -6,6 +6,7 @@
 #include "pbi_platform.hpp"
 #include "dax_column_names.hpp"
 #include "dax_probe.hpp"
+#include "local_instances.hpp"
 #include "metadata_cache.hpp"
 #include "pbi_scanner_util.hpp"
 #include "xmla.hpp"
@@ -600,3 +601,80 @@ TEST_CASE("Describe XMLA TCP negotiation flags", "[xmla_tcp]") {
       Catch::Matchers::Contains("only supported in native Windows builds"));
 #endif
 }
+
+TEST_CASE("Parse msmdsrv.port.txt", "[local_instances]") {
+  uint16_t port = 0;
+  // UTF-16LE with BOM, as Power BI Desktop writes it.
+  REQUIRE(ParseMsmdsrvPortFile(std::string("\xFF\xFE"
+                                           "6\0"
+                                           "0\0"
+                                           "7\0"
+                                           "9\0"
+                                           "0\0",
+                                           12),
+                               port));
+  REQUIRE(port == 60790);
+  // UTF-16LE without BOM, trailing CRLF and NUL.
+  REQUIRE(ParseMsmdsrvPortFile(std::string("5\0"
+                                           "1\0"
+                                           "3\0"
+                                           "2\0"
+                                           "\r\0"
+                                           "\n\0"
+                                           "\0\0",
+                                           14),
+                               port));
+  REQUIRE(port == 5132);
+  REQUIRE(ParseMsmdsrvPortFile("\xEF\xBB\xBF"
+                               "60791\n",
+                               port));
+  REQUIRE(port == 60791);
+  REQUIRE(ParseMsmdsrvPortFile(" 1 ", port));
+  REQUIRE(port == 1);
+
+  REQUIRE(!ParseMsmdsrvPortFile("", port));
+  REQUIRE(!ParseMsmdsrvPortFile("0", port));
+  REQUIRE(!ParseMsmdsrvPortFile("65536", port));
+  REQUIRE(!ParseMsmdsrvPortFile("60x90", port));
+  REQUIRE(!ParseMsmdsrvPortFile(std::string("\xFF\xFE"
+                                            "6\x01",
+                                            4),
+                                port));
+}
+
+TEST_CASE("Report name from Power BI Desktop window title",
+          "[local_instances]") {
+  REQUIRE(ReportNameFromDesktopWindowTitle("Sales Model - Power BI Desktop") ==
+          "Sales Model");
+  REQUIRE(ReportNameFromDesktopWindowTitle(
+              "Finance - Q4 - Power BI Desktop  ") == "Finance - Q4");
+  REQUIRE(ReportNameFromDesktopWindowTitle(
+              "Ops \xE2\x80\x93 Power BI Desktop") == "Ops");
+  REQUIRE(ReportNameFromDesktopWindowTitle("Power BI Desktop").empty());
+  REQUIRE(ReportNameFromDesktopWindowTitle("").empty());
+
+  REQUIRE(BuildLocalConnectionString(60790, "") ==
+          "Data Source=localhost:60790;");
+  REQUIRE(BuildLocalConnectionString(60790, "abc-123") ==
+          "Data Source=localhost:60790;Initial Catalog=abc-123;");
+}
+
+#ifndef _WIN32
+TEST_CASE("Local Desktop functions are Windows only", "[local_instances]") {
+  DuckDB db(nullptr);
+  ExtensionHelper::LoadExtension(db, "pbi_scanner");
+  Connection con(db);
+  auto instances = con.Query("SELECT * FROM pbi_local_instances()");
+  REQUIRE(instances->HasError());
+  REQUIRE_THAT(instances->GetError(),
+               Catch::Matchers::Contains(
+                   "pbi_local_instances is only supported in native Windows "
+                   "builds of pbi_scanner"));
+  auto probe = con.Query(
+      "SELECT * FROM pbi_local_probe('Data Source=localhost:60790;')");
+  REQUIRE(probe->HasError());
+  REQUIRE_THAT(probe->GetError(),
+               Catch::Matchers::Contains("only supported in native Windows "
+                                         "builds of pbi_scanner"));
+}
+#endif

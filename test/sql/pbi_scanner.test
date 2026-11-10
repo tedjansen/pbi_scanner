@@ -283,10 +283,11 @@ access_token named parameter or PBI_XMLA_ACCESS_TOKEN environment variable is re
 query I
 SELECT count(*)
 FROM duckdb_functions()
-WHERE function_name = 'pbi_local_probe'
-  AND categories = ['powerbi'];
+WHERE function_name IN ('pbi_local_probe', 'pbi_local_instances')
+  AND categories = ['powerbi']
+  AND len(examples) = 1;
 ----
-1
+2
 
 statement error
 SELECT * FROM pbi_local_probe('Data Source=powerbi://api.powerbi.com/v1.0/myorg/Example%20Workspace;');
@@ -307,3 +308,13 @@ statement error
 SELECT * FROM pbi_local_probe('localhost:60790', protection := 'bogus');
 ----
 protection must be all, skip, none, integrity, or privacy
+
+statement error
+SELECT * FROM pbi_local_instances(protection := 'bogus');
+----
+protection must be none, integrity, or privacy
+
+statement error
+SELECT * FROM pbi_local_instances(timeout_ms := 0);
+----
+timeout_ms must be greater than zero

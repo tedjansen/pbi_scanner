@@ -313,17 +313,30 @@ static void LocalProbeExecute(ClientContext &, TableFunctionInput &input,
 
 } // namespace
 
+vector<string> LocalProbeNamedParameterNames() {
+  return {"package", "protection", "target_name", "dax_text", "timeout_ms"};
+}
+
 TableFunction CreatePbiLocalProbeFunction() {
   TableFunction function("pbi_local_probe", {LogicalType::VARCHAR},
                          LocalProbeExecute, LocalProbeBind, LocalProbeInit);
+#ifdef PBI_DUCKDB_MAIN_SIGNATURES
+  // Keep this order in sync with LocalProbeNamedParameterNames().
+  function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &kwargs) {
+    kwargs.Add("package", LogicalType::VARCHAR);
+    kwargs.Add("protection", LogicalType::VARCHAR);
+    kwargs.Add("target_name", LogicalType::VARCHAR);
+    kwargs.Add("dax_text", LogicalType::VARCHAR);
+    kwargs.Add("timeout_ms", LogicalType::BIGINT);
+  });
+  function.GetSignature().GetParameter(0).SetName(
+      Identifier("connection_string"));
+#else
   function.named_parameters["package"] = LogicalType::VARCHAR;
   function.named_parameters["protection"] = LogicalType::VARCHAR;
   function.named_parameters["target_name"] = LogicalType::VARCHAR;
   function.named_parameters["dax_text"] = LogicalType::VARCHAR;
   function.named_parameters["timeout_ms"] = LogicalType::BIGINT;
-#ifdef PBI_DUCKDB_MAIN_SIGNATURES
-  function.GetSignature().GetParameter(0).SetName(
-      Identifier("connection_string"));
 #endif
   return function;
 }

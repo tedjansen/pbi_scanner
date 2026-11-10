@@ -2,6 +2,7 @@
 
 #include "pbi_scanner_extension.hpp"
 #include "dax_query.hpp"
+#include "local_instances.hpp"
 #include "local_probe.hpp"
 #include "pbi_duckdb_compat.hpp"
 #include "pbi_scanner_util.hpp"
@@ -37,9 +38,17 @@ static const string kExampleConnectionString =
     "Data Source=powerbi://api.powerbi.com/v1.0/myorg/"
     "Example%20Workspace;Initial Catalog=example_semantic_model;";
 
-static vector<string> CatalogParameterNames(const TableFunction &function,
-                                            vector<string> positional) {
+static vector<string>
+CatalogParameterNames(const TableFunction &function, vector<string> positional,
+                      const vector<string> *main_named_options = nullptr) {
 #ifdef PBI_DUCKDB_MAIN_SIGNATURES
+  if (main_named_options) {
+    (void)function;
+    for (auto &name : *main_named_options) {
+      positional.push_back(name);
+    }
+    return positional;
+  }
   // DuckDB main lists parameters from the signature. When that list already
   // covers every type, duckdb_functions() ignores FunctionDescription names.
   // This fallback matches WithTypedKwargs insertion order in
@@ -55,6 +64,7 @@ static vector<string> CatalogParameterNames(const TableFunction &function,
     positional.emplace_back(name);
   }
 #else
+  (void)main_named_options;
   if (positional.size() != function.arguments.size()) {
     throw InternalException("pbi_scanner catalog positional names do not match "
                             "the function arguments");
@@ -154,14 +164,26 @@ static void LoadInternal(ExtensionLoader &loader) {
       "connection_string is positional; named options use :=.",
       ExampleSelect("pbi_relationships", ""));
   auto pbi_local_probe = CreatePbiLocalProbeFunction();
+  auto pbi_local_probe_options = LocalProbeNamedParameterNames();
   RegisterDocumentedTableFunction(
       loader, pbi_local_probe,
-      CatalogParameterNames(pbi_local_probe, {"connection_string"}),
+      CatalogParameterNames(pbi_local_probe, {"connection_string"},
+                            &pbi_local_probe_options),
       "Experimental (Windows only): diagnoses a connection to a local Power "
       "BI Desktop model at Data Source=localhost:<port> over the native "
       "Analysis Services TCP protocol and returns one row per handshake "
       "step.",
       "SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');");
+  auto pbi_local_instances = CreatePbiLocalInstancesFunction();
+  auto pbi_local_instances_options = LocalInstancesNamedParameterNames();
+  RegisterDocumentedTableFunction(
+      loader, pbi_local_instances,
+      CatalogParameterNames(pbi_local_instances, {},
+                            &pbi_local_instances_options),
+      "Experimental (Windows only): lists the models open in Power BI "
+      "Desktop on this machine with report name, port, catalog and a ready "
+      "connection_string for dax_query.",
+      "SELECT report_name, connection_string FROM pbi_local_instances();");
 }
 
 void PbiScannerExtension::Load(ExtensionLoader &loader) {
