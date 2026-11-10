@@ -483,6 +483,25 @@ If `.\scripts\dev-win.ps1 configure` reports a missing vcpkg toolchain file,
 run `.\scripts\dev-win.ps1 bootstrap` or set `%VCPKG_ROOT%` to an existing
 vcpkg checkout.
 
+### Local Power BI Desktop (Windows, experimental)
+
+Work in progress: running DAX against a model open in Power BI Desktop. Desktop
+hosts the model in a local Analysis Services instance on `localhost:<port>`.
+That instance speaks the native Analysis Services TCP protocol with Windows
+authentication, not XMLA over HTTP.
+
+The current build ships only a diagnostic function, which is Windows only:
+
+```sql
+SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');
+```
+
+`dax_query` and the `pbi_*` metadata functions do not accept
+`Data Source=localhost:<port>` yet. On other platforms and in DuckDB-Wasm,
+local targets raise an `InvalidInputException`. For the design, see
+[docs/local_desktop.md](docs/local_desktop.md). To run the probe on Windows,
+see [docs/local_desktop_smoke.md](docs/local_desktop_smoke.md).
+
 ## Troubleshooting
 
 ### OpenSSL Not Found

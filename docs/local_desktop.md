@@ -1,0 +1,116 @@
+# Local Power BI Desktop (Windows): design notes
+
+Status: **spike**. The wire codec is implemented and covered by offline tests.
+The Windows socket/SSPI client and the `pbi_local_probe` diagnostic function
+are in place. `dax_query` and the `pbi_*` metadata functions do not accept
+local targets yet. See "Next steps" below.
+
+Tracking issue: crazy-treyn/pbi_scanner#19.
+
+## Problem
+
+Power BI Desktop hosts the open model in a local Analysis Services instance
+(`msmdsrv.exe`). It listens on `localhost:<random port>` and writes the port to
+`...\AnalysisServicesWorkspaces\<id>\Data\msmdsrv.port.txt`. That instance does
+not serve XMLA over HTTP. It speaks the native Analysis Services TCP protocol
+and uses Windows integrated authentication. `pbi_scanner` today only sends XMLA
+over HTTP(S) with a Bearer token.
+
+## Protocol (from [MS-SSAS])
+
+All of this comes from the Open Specifications document
+[MS-SSAS] *SQL Server Analysis Services Protocol*:
+
+| Topic | Section | Summary |
+| --- | --- | --- |
+| Transport | 2.1 | TCP or HTTP(S). SOAP XML or binary XML, optionally compressed. Network byte order unless stated otherwise. DIME is used on TCP. |
+| Framing | 2.1.1 | Each SOAP message is a DIME message of one or more records. Record header: `VERSION(5)=1, MB, ME, CF, TYPE_T(4), RESERVED(4), OPTIONS_LENGTH(16), ID_LENGTH(16), TYPE_LENGTH(16), DATA_LENGTH(32)`, then OPTIONS/ID/TYPE/DATA, each padded to 4 bytes. TYPE is `text/xml`, `application/sx`, `application/xml+xpress` or `application/sx+xpress`. |
+| Negotiation | 2.1.1, 3.2.3 | The 4-byte OPTIONS field carries flags (LSB first): `NEGO, REQ_SX, REQ_XPRESS, RESP_SX, RESP_XPRESS`. The first request and its response are always text XML with `NEGO=0`. The server keeps no negotiation state, so both sides send the flags on every message. These are the same five flags as the HTTP `X-Transport-Caps-Negotiation-Flags` header the extension already sends. |
+| Authentication | 3.2.2, 3.1.4.1 | GSS-API (SPNEGO). Tokens travel base64-encoded in the XMLA `Authenticate` method (`<Authenticate xmlns="http://schemas.microsoft.com/analysisservices/2003/ext"><SspiHandshake>…`), answered by `AuthenticateResponse/return/SspiHandshake`, until GSS-API reports completion. |
+| Message protection | 2.1.3 | If signing or encryption was negotiated, the payload is a sequence of blocks `DATA_SIZE(16, LE), TOKEN_SIZE(16, LE), DATA, TOKEN`. A block can span DIME records. |
+| Compression | 2.1.4, 3.2.5 | Blocks of `ORIGINAL_SIZE(32, LE), COMPRESSED_SIZE(32, LE), DATA`. This is the same Xpress framing the HTTP path already decodes (`src/xpress.cpp`). |
+| Binary XML | 2.1.5 | [MS-BINXML], already parsed by `src/xmla.cpp`. |
+| Layering | 3.2.4 | Send: SOAP → binary XML (optional) → compress (optional) → encrypt/sign (optional) → DIME. Receive: the reverse. |
+| Product defaults | Appendix A <1>–<3> | Analysis Services splits messages into several DIME records and uses `application/sx+xpress` by default. |
+
+The only new pieces compared with the HTTP path are DIME, the `Authenticate`
+loop and the optional GSS-API wrap layer. The envelopes, `ProtocolCapabilities`,
+Xpress decompression and the plain/binary XML parsers are reused unchanged.
+
+## Code layout (spike)
+
+- `src/xmla_tcp.cpp` / `src/include/xmla_tcp.hpp`: platform-independent pieces.
+  This covers the DIME encoder and incremental reader, the GSS-API wrap block
+  codec, the `Authenticate` envelope and response parser, the
+  `DBSCHEMA_CATALOGS` envelope and parser, and `localhost:<port>` recognition.
+  Offline tests live in `test/cpp/pbi_scanner_unit_tests.cpp` (`[xmla_tcp]`).
+- `src/xmla_tcp_client.cpp` / `src/include/xmla_tcp_client.hpp`:
+  `LocalXmlaTcpClient`. On Windows it uses Winsock, SSPI (`secur32`:
+  `AcquireCredentialsHandleW`, `InitializeSecurityContextW`, and
+  `EncryptMessage`/`MakeSignature` with their counterparts), DIME round trips
+  and optional message protection. On other platforms, including WASM, it
+  throws `InvalidInputException`.
+- `src/local_probe.cpp`: the `pbi_local_probe(connection_string, ...)` table
+  function, for the spike only. Each attempt (protection `skip`, `none`,
+  `integrity`, `privacy`) does the following:
+  - connects;
+  - authenticates, unless the protection is `skip`;
+  - discovers the catalog;
+  - runs a typed `EVALUATE ROW(...)` once as plain XML and once with
+    `sx+xpress`.
+
+  It returns one row per step. `PBI_SCANNER_LOCAL_TRACE=1` adds hex previews
+  of every message on stderr.
+
+## Open questions the Windows probe answers
+
+1. Does Desktop's `msmdsrv` accept requests without `Authenticate` (attempt
+   `skip`)?
+2. Which SSPI package actually runs for loopback: Negotiate falling back to
+   NTLM, or Kerberos. How many rounds does it take?
+3. Does the server require signing or encryption, or does it accept
+   `protection=none`? Do our wrap-block layout and SSPI buffer order match the
+   server for `integrity` and `privacy`?
+4. Does the server honour `RESP_SX|RESP_XPRESS` on TCP? Which TYPE and OPTIONS
+   does it send back? Do the existing parsers decode the payload?
+5. Does `DBSCHEMA_CATALOGS` return exactly one GUID-named catalog?
+
+## Planned public surface
+
+- `Data Source=localhost:<port>` (also `127.0.0.1:<port>`, `[::1]:<port>`),
+  with no scheme. `Initial Catalog` is optional for local targets. When it is
+  omitted, the extension discovers it through `DBSCHEMA_CATALOGS`.
+- No token resolution for local targets. Authentication is always the current
+  Windows user. `auth_mode`, `access_token`, `secret_name` and the service
+  principal parameters are rejected for local targets.
+- Same column naming (`normalize_dax_column_names`) and type coercion as the
+  service path, because the same parsers are used.
+- Local targets are not stored in the metadata cache: the port changes on
+  every Desktop start.
+- Clear `InvalidInputException` on non-Windows and WASM builds:
+  `Local Power BI Desktop connections (Data Source=localhost:<port>) are only
+  supported in native Windows builds of pbi_scanner`.
+
+## Next steps (after the probe results)
+
+1. Add a `localhost:<port>` target kind to `PowerBIConnectionConfig` and make
+   `Initial Catalog` optional for it.
+2. Introduce a small channel abstraction in `XmlaExecutor`, so that
+   `ProbeSchema` and `ExecuteStreaming` can run over either `HttpClient` or
+   `LocalXmlaTcpClient`. The TCP channel reports the DIME TYPE as the content
+   type and streams the record data into the existing decoders.
+3. Branch in `src/dax_query.cpp` bind/execute: skip the resolver, token
+   resolution and the metadata cache for local targets.
+4. sqllogictest coverage for accepted and rejected connection strings, plus a
+   Catch test that feeds a synthetic DIME `sx+xpress` response through the
+   channel.
+5. Decide whether to keep `pbi_local_probe` as a documented diagnostic or
+   remove it.
+
+## Out of scope (follow-ups)
+
+- RLS testing against Desktop (`Roles=`, `EffectiveUserName`).
+- Automatic port discovery inside the extension. Callers read
+  `msmdsrv.port.txt`.
+- On-premises SSAS over the network, Kerberos delegation, and explicit
+  credentials.
