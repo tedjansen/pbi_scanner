@@ -2,6 +2,7 @@
 
 #include "pbi_scanner_extension.hpp"
 #include "dax_query.hpp"
+#include "local_probe.hpp"
 #include "pbi_duckdb_compat.hpp"
 #include "pbi_scanner_util.hpp"
 
@@ -152,6 +153,15 @@ static void LoadInternal(ExtensionLoader &loader) {
       "EVALUATE INFO.VIEW.RELATIONSHIPS(). "
       "connection_string is positional; named options use :=.",
       ExampleSelect("pbi_relationships", ""));
+  auto pbi_local_probe = CreatePbiLocalProbeFunction();
+  RegisterDocumentedTableFunction(
+      loader, pbi_local_probe,
+      CatalogParameterNames(pbi_local_probe, {"connection_string"}),
+      "Experimental (Windows only): diagnoses a connection to a local Power "
+      "BI Desktop model at Data Source=localhost:<port> over the native "
+      "Analysis Services TCP protocol and returns one row per handshake "
+      "step.",
+      "SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');");
 }
 
 void PbiScannerExtension::Load(ExtensionLoader &loader) {

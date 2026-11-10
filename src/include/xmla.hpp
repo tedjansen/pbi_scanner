@@ -1,6 +1,7 @@
 #pragma once
 
 #include "http_client.hpp"
+#include "xmla_transport.hpp"
 
 #include "duckdb/common/types/value.hpp"
 
@@ -55,6 +56,10 @@ struct XmlaParseTestResult {
 std::string BuildXmlaExecuteEnvelope(const std::string &catalog,
                                      const std::string &statement,
                                      const std::string &effective_user_name);
+//! Same envelope for an explicit transport mode (ProtocolCapabilities header).
+std::string BuildXmlaExecuteEnvelopeForMode(
+    const std::string &catalog, const std::string &statement,
+    const std::string &effective_user_name, XmlaTransportMode transport_mode);
 XmlaParseTestResult
 ParseXmlaChunksForTesting(const std::vector<std::string> &chunks,
                           bool stop_after_schema = false);

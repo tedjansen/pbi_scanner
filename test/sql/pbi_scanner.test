@@ -279,3 +279,31 @@ FROM dax_query(
 );
 ----
 access_token named parameter or PBI_XMLA_ACCESS_TOKEN environment variable is required
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name = 'pbi_local_probe'
+  AND categories = ['powerbi'];
+----
+1
+
+statement error
+SELECT * FROM pbi_local_probe('Data Source=powerbi://api.powerbi.com/v1.0/myorg/Example%20Workspace;');
+----
+pbi_local_probe expects Data Source=localhost:<port>
+
+statement error
+SELECT * FROM pbi_local_probe('Data Source=localhost;');
+----
+Local Data Source must be localhost:<port> with a port between 1 and 65535
+
+statement error
+SELECT * FROM pbi_local_probe('localhost:70000');
+----
+Local Data Source must be localhost:<port> with a port between 1 and 65535
+
+statement error
+SELECT * FROM pbi_local_probe('localhost:60790', protection := 'bogus');
+----
+protection must be all, skip, none, integrity, or privacy

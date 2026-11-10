@@ -3295,6 +3295,13 @@ std::string BuildXmlaExecuteEnvelope(const std::string &catalog,
       catalog, statement, effective_user_name, ResolveXmlaTransportMode());
 }
 
+std::string BuildXmlaExecuteEnvelopeForMode(
+    const std::string &catalog, const std::string &statement,
+    const std::string &effective_user_name, XmlaTransportMode transport_mode) {
+  return BuildXmlaExecuteEnvelopeForTransport(
+      catalog, statement, effective_user_name, transport_mode);
+}
+
 XmlaParseTestResult
 ParseXmlaChunksForTesting(const std::vector<std::string> &chunks,
                           bool stop_after_schema) {

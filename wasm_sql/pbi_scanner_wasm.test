@@ -277,3 +277,8 @@ FROM dax_query(
 );
 ----
 service_principal auth is not supported in browser DuckDB-Wasm
+
+statement error
+SELECT * FROM pbi_local_probe('Data Source=localhost:60790;');
+----
+Local Power BI Desktop connections (Data Source=localhost:<port>) are only supported in native Windows builds of pbi_scanner

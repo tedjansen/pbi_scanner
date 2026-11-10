@@ -9,6 +9,8 @@
 #include "metadata_cache.hpp"
 #include "pbi_scanner_util.hpp"
 #include "xmla.hpp"
+#include "xmla_tcp.hpp"
+#include "xmla_tcp_client.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -362,4 +364,239 @@ TEST_CASE("Resolve normalize dax column names setting", "[dax_column_names]") {
   named_parameter_map_t override_off;
   override_off["normalize_dax_column_names"] = Value::BOOLEAN(false);
   REQUIRE(!ResolveNormalizeDaxColumnNames(context, override_off));
+}
+
+namespace {
+
+std::string DecodeHexForTcpTests(const std::string &hex) {
+  std::string out;
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    out.push_back(
+        static_cast<char>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+  }
+  return out;
+}
+
+struct DecodedDimeMessage {
+  std::string data;
+  std::string content_type;
+  uint8_t caps = 0;
+  idx_t records = 0;
+  idx_t consumed = 0;
+};
+
+DecodedDimeMessage DecodeDimeInSlices(const std::string &wire, idx_t slice) {
+  DecodedDimeMessage result;
+  DimeMessageReader reader([&](const_data_ptr_t data, idx_t size) {
+    result.data.append(reinterpret_cast<const char *>(data), size);
+    return true;
+  });
+  for (idx_t offset = 0; offset < wire.size() && !reader.MessageComplete();
+       offset += slice) {
+    auto size = std::min<idx_t>(slice, wire.size() - offset);
+    result.consumed +=
+        reader.Feed(const_data_ptr_cast(wire.data()) + offset, size);
+  }
+  REQUIRE(reader.MessageComplete());
+  result.content_type = reader.ContentType();
+  result.caps = reader.CapsFlags();
+  result.records = reader.RecordCount();
+  return result;
+}
+
+} // namespace
+
+TEST_CASE("Encode DIME records per MS-SSAS 2.1.1", "[xmla_tcp]") {
+  auto wire = EncodeDimeMessage("text/xml",
+                                XMLA_TCP_CAPS_NEGO | XMLA_TCP_CAPS_RESP_SX |
+                                    XMLA_TCP_CAPS_RESP_XPRESS,
+                                "abc");
+  // VERSION=1 MB ME | TYPE_T=1, OPTIONS_LENGTH=4, ID_LENGTH=0, TYPE_LENGTH=8,
+  // DATA_LENGTH=3, OPTIONS, TYPE, DATA + 1 padding byte.
+  REQUIRE(wire == DecodeHexForTcpTests("0e1000040000000800000003"
+                                       "19000000"
+                                       "746578742f786d6c"
+                                       "61626300"));
+  auto header = DecodeDimeRecordHeader(const_data_ptr_cast(wire.data()));
+  REQUIRE(header.version == 1);
+  REQUIRE(header.message_begin);
+  REQUIRE(header.message_end);
+  REQUIRE(!header.chunked);
+  REQUIRE(header.type_format == 1);
+  REQUIRE(header.data_length == 3);
+}
+
+TEST_CASE("Chunked DIME messages round-trip", "[xmla_tcp]") {
+  std::string payload;
+  for (int i = 0; i < 1000; i++) {
+    payload.push_back(static_cast<char>('a' + (i % 26)));
+  }
+  auto wire = EncodeDimeMessage("application/sx+xpress", 0x19, payload, 333);
+  auto first = DecodeDimeRecordHeader(const_data_ptr_cast(wire.data()));
+  REQUIRE(first.message_begin);
+  REQUIRE(!first.message_end);
+  REQUIRE(first.chunked);
+  REQUIRE(first.type_format == 1);
+  REQUIRE(first.data_length == 333);
+
+  for (idx_t slice : {idx_t(1), idx_t(5), idx_t(64), idx_t(4096)}) {
+    auto decoded = DecodeDimeInSlices(wire, slice);
+    REQUIRE(decoded.data == payload);
+    REQUIRE(decoded.content_type == "application/sx+xpress");
+    REQUIRE(decoded.caps == 0x19);
+    REQUIRE(decoded.records == 4);
+    REQUIRE(decoded.consumed == wire.size());
+  }
+}
+
+TEST_CASE("DIME reader stops at the message boundary", "[xmla_tcp]") {
+  auto wire = EncodeDimeMessage("text/xml", 0, "") +
+              EncodeDimeMessage("text/xml", 0, "next");
+  std::string data;
+  DimeMessageReader reader([&](const_data_ptr_t bytes, idx_t size) {
+    data.append(reinterpret_cast<const char *>(bytes), size);
+    return true;
+  });
+  auto consumed = reader.Feed(const_data_ptr_cast(wire.data()), wire.size());
+  REQUIRE(reader.MessageComplete());
+  REQUIRE(data.empty());
+  REQUIRE(consumed == 12 + 4 + 8);
+}
+
+TEST_CASE("DIME reader rejects malformed records", "[xmla_tcp]") {
+  auto wire = EncodeDimeMessage("text/xml", 0, "abc");
+  auto bad_version = wire;
+  bad_version[0] = static_cast<char>((2 << 3) | 0x06);
+  DimeMessageReader version_reader(nullptr);
+  REQUIRE_THROWS_WITH(
+      version_reader.Feed(const_data_ptr_cast(bad_version.data()),
+                          bad_version.size()),
+      Catch::Matchers::Contains("Unsupported DIME record version 2"));
+
+  auto no_begin = wire;
+  no_begin[0] = static_cast<char>((1 << 3) | 0x02);
+  DimeMessageReader begin_reader(nullptr);
+  REQUIRE_THROWS_WITH(
+      begin_reader.Feed(const_data_ptr_cast(no_begin.data()), no_begin.size()),
+      Catch::Matchers::Contains("MB record"));
+}
+
+TEST_CASE("GSS-API wrap blocks per MS-SSAS 2.1.3", "[xmla_tcp]") {
+  auto block = EncodeGssWrapBlock("hello", "TK");
+  REQUIRE(block == DecodeHexForTcpTests("05000200") + "helloTK");
+  auto wire = block + EncodeGssWrapBlock("", "sig") +
+              EncodeGssWrapBlock(std::string(300, 'x'), "");
+  std::vector<std::pair<std::string, std::string>> blocks;
+  GssWrapBlockReader reader(
+      [&](const std::string &data, const std::string &token) {
+        blocks.emplace_back(data, token);
+      });
+  for (size_t i = 0; i < wire.size(); i += 7) {
+    reader.Feed(const_data_ptr_cast(wire.data()) + i,
+                std::min<size_t>(7, wire.size() - i));
+  }
+  REQUIRE_NOTHROW(reader.Finish());
+  REQUIRE(blocks.size() == 3);
+  REQUIRE(blocks[0].first == "hello");
+  REQUIRE(blocks[0].second == "TK");
+  REQUIRE(blocks[1].first.empty());
+  REQUIRE(blocks[1].second == "sig");
+  REQUIRE(blocks[2].first == std::string(300, 'x'));
+
+  GssWrapBlockReader truncated([](const std::string &, const std::string &) {});
+  truncated.Feed(const_data_ptr_cast(block.data()), block.size() - 1);
+  REQUIRE_THROWS_WITH(truncated.Finish(),
+                      Catch::Matchers::Contains("Truncated GSS-API"));
+}
+
+TEST_CASE("XMLA Authenticate envelope and response", "[xmla_tcp]") {
+  auto envelope = BuildXmlaAuthenticateEnvelope(std::string("NTLMSSP\0\1", 9));
+  REQUIRE(envelope.find("<Authenticate "
+                        "xmlns=\"http://schemas.microsoft.com/analysisservices/"
+                        "2003/ext\"><SspiHandshake>TlRMTVNTUAAB</"
+                        "SspiHandshake>") != std::string::npos);
+
+  auto token = ParseXmlaAuthenticateResponse(
+      "<soap:Envelope "
+      "xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body>"
+      "<AuthenticateResponse "
+      "xmlns=\"http://schemas.microsoft.com/analysisservices/2003/ext\">"
+      "<return><SspiHandshake>TlRMTVNTUAAC</SspiHandshake></return>"
+      "</AuthenticateResponse></soap:Body></soap:Envelope>");
+  REQUIRE(token == std::string("NTLMSSP\0\2", 9));
+
+  REQUIRE(ParseXmlaAuthenticateResponse(
+              "<Envelope><Body><AuthenticateResponse><return><SspiHandshake/>"
+              "</return></AuthenticateResponse></Body></Envelope>")
+              .empty());
+
+  REQUIRE_THROWS_WITH(
+      ParseXmlaAuthenticateResponse(
+          "<soap:Envelope><soap:Body><soap:Fault><faultcode>XMLAnalysisError."
+          "0xc1060000</faultcode><faultstring>Authentication failed"
+          "</faultstring><detail><Error ErrorCode=\"1\" Description=\"The "
+          "user &apos;x&apos; does not have permission\"/></detail>"
+          "</soap:Fault></soap:Body></soap:Envelope>"),
+      Catch::Matchers::Contains("Authentication failed: The user 'x' does not "
+                                "have permission"));
+  REQUIRE_THROWS_WITH(ParseXmlaAuthenticateResponse("<Envelope/>"),
+                      Catch::Matchers::Contains("AuthenticateResponse"));
+}
+
+TEST_CASE("Parse DBSCHEMA_CATALOGS names", "[xmla_tcp]") {
+  REQUIRE(BuildXmlaDiscoverCatalogsEnvelope().find(
+              "<RequestType>DBSCHEMA_CATALOGS</RequestType>") !=
+          std::string::npos);
+  auto names = ParseXmlaCatalogNames(
+      "<return><root xmlns=\"urn:schemas-microsoft-com:xml-analysis:rowset\">"
+      "<xsd:schema/><row><CATALOG_NAME>0f1e2d3c-aaaa-bbbb-cccc-"
+      "000000000001</CATALOG_NAME><DESCRIPTION/></row>"
+      "<row><CATALOG_NAME>Sales &amp; Ops</CATALOG_NAME></row></root>"
+      "</return>");
+  REQUIRE(names.size() == 2);
+  REQUIRE(names[0] == "0f1e2d3c-aaaa-bbbb-cccc-000000000001");
+  REQUIRE(names[1] == "Sales & Ops");
+}
+
+TEST_CASE("Recognize local Analysis Services data sources", "[xmla_tcp]") {
+  std::string host;
+  uint16_t port = 0;
+  REQUIRE(TryParseLocalInstanceDataSource("localhost:60790", host, port));
+  REQUIRE(host == "localhost");
+  REQUIRE(port == 60790);
+  REQUIRE(TryParseLocalInstanceDataSource(" LocalHost:1 ", host, port));
+  REQUIRE(port == 1);
+  REQUIRE(TryParseLocalInstanceDataSource("127.0.0.1:65535", host, port));
+  REQUIRE(host == "127.0.0.1");
+  REQUIRE(TryParseLocalInstanceDataSource("[::1]:5132", host, port));
+  REQUIRE(host == "::1");
+  REQUIRE(port == 5132);
+  REQUIRE(TryParseLocalInstanceDataSource("::1:5133", host, port));
+  REQUIRE(port == 5133);
+
+  REQUIRE(!TryParseLocalInstanceDataSource(
+      "powerbi://api.powerbi.com/v1.0/myorg/Example", host, port));
+  REQUIRE(!TryParseLocalInstanceDataSource("http://localhost:8123/xmla", host,
+                                           port));
+  REQUIRE(!TryParseLocalInstanceDataSource("example.com:443", host, port));
+
+  for (auto bad : {"localhost", "localhost:", "localhost:0", "localhost:65536",
+                   "127.0.0.1:12a", "[::1]"}) {
+    REQUIRE_THROWS_WITH(TryParseLocalInstanceDataSource(bad, host, port),
+                        Catch::Matchers::Contains(
+                            "Local Data Source must be localhost:<port>"));
+  }
+}
+
+TEST_CASE("Describe XMLA TCP negotiation flags", "[xmla_tcp]") {
+  REQUIRE(DescribeXmlaTcpCapsFlags(0) == "0x00");
+  REQUIRE(DescribeXmlaTcpCapsFlags(0x19) == "0x19 (NEGO|RESP_SX|RESP_XPRESS)");
+  REQUIRE(HexPreview(std::string("\x01\xab", 2), 1) == "01...");
+#ifndef _WIN32
+  REQUIRE(!LocalXmlaTcpClient::IsSupported());
+  LocalXmlaTcpClient client(1000, nullptr);
+  REQUIRE_THROWS_WITH(
+      client.Connect("localhost", 60790),
+      Catch::Matchers::Contains("only supported in native Windows builds"));
+#endif
 }
