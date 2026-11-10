@@ -134,6 +134,15 @@ These come from Power BI Desktop, Microsoft Store install:
   checking once local targets are wired in.
 - Desktop advertises `REQ_SX|REQ_XPRESS` in every response. Requests stay
   plain text XML.
+- `EVALUATE TOPN(5, INFO.VIEW.TABLES())` works over plain XML, with real
+  names and types (BIGINT, VARCHAR, BOOLEAN). That response arrived in two
+  DIME records, which the reader reassembles. A column that is entirely
+  `BLANK()` is left out of the schema.
+- The probe's stand-alone sx decode, which has no known schema, drops or
+  `NULL`s BOOLEAN columns. Examples are `C4`/`C8` in `INFO.VIEW.TABLES`, and
+  `TRUE()` in `EVALUATE ROW`. `dax_query` decodes sx against the schema it
+  probed with `xpress`, so booleans must be checked through `dax_query` once
+  local targets are wired in.
 
 ## Open questions the Windows probe answers
 
