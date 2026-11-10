@@ -526,6 +526,18 @@ TEST_CASE("XMLA Authenticate envelope and response", "[xmla_tcp]") {
       "</AuthenticateResponse></soap:Body></soap:Envelope>");
   REQUIRE(token == std::string("NTLMSSP\0\2", 9));
 
+  // Observed from Power BI Desktop: MIME-style line breaks in the base64.
+  REQUIRE(ParseXmlaAuthenticateResponse(
+              "<soap:Envelope><soap:Body><AuthenticateResponse><return>"
+              "<SspiHandshake>TlRM\r\nTVNT\nUAAC</SspiHandshake></return>"
+              "</AuthenticateResponse></soap:Body></soap:Envelope>") ==
+          std::string("NTLMSSP\0\2", 9));
+  REQUIRE_THROWS_WITH(
+      ParseXmlaAuthenticateResponse(
+          "<AuthenticateResponse><return><SspiHandshake>@@@@</SspiHandshake>"
+          "</return></AuthenticateResponse>"),
+      Catch::Matchers::Contains("invalid base64"));
+
   REQUIRE(ParseXmlaAuthenticateResponse(
               "<Envelope><Body><AuthenticateResponse><return><SspiHandshake/>"
               "</return></AuthenticateResponse></Body></Envelope>")
@@ -650,6 +662,10 @@ TEST_CASE("Report name from Power BI Desktop window title",
               "Finance - Q4 - Power BI Desktop  ") == "Finance - Q4");
   REQUIRE(ReportNameFromDesktopWindowTitle(
               "Ops \xE2\x80\x93 Power BI Desktop") == "Ops");
+  // Observed on the Microsoft Store install: the title is just the report.
+  REQUIRE(ReportNameFromDesktopWindowTitle("Uren") == "Uren");
+  REQUIRE(!DesktopWindowTitleHasSuffix("Uren"));
+  REQUIRE(DesktopWindowTitleHasSuffix("Sales Model - Power BI Desktop"));
   REQUIRE(ReportNameFromDesktopWindowTitle("Power BI Desktop").empty());
   REQUIRE(ReportNameFromDesktopWindowTitle("").empty());
 

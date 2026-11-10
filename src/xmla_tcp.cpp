@@ -450,9 +450,18 @@ std::string ParseXmlaAuthenticateResponse(const std::string &xml) {
   if (token.empty()) {
     return std::string();
   }
+  // Analysis Services wraps the base64 text in MIME-style lines (76
+  // characters plus CR/LF); the decoder only accepts the bare alphabet.
+  std::string compact;
+  compact.reserve(token.size());
+  for (auto ch : token) {
+    if (!StringUtil::CharacterIsSpace(ch)) {
+      compact.push_back(ch);
+    }
+  }
   try {
     return Blob::FromBase64(
-        string_t(token.data(), static_cast<uint32_t>(token.size())));
+        string_t(compact.data(), static_cast<uint32_t>(compact.size())));
   } catch (const std::exception &) {
     throw IOException("XMLA Authenticate response has an invalid base64 "
                       "SspiHandshake");

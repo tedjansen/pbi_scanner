@@ -30,7 +30,7 @@ Get-Content instances.csv
 
 | column | meaning |
 | --- | --- |
-| `report_name` | Taken from the `PBIDesktop.exe` window title (`<name> - Power BI Desktop`). |
+| `report_name` | Taken from the `PBIDesktop.exe` window title: `<name> - Power BI Desktop`, or just `<name>` on newer builds. |
 | `port` | The listening TCP port of `msmdsrv.exe`. |
 | `catalog` | The database GUID, from `DBSCHEMA_CATALOGS`. |
 | `connection_string` | `Data Source=localhost:<port>;Initial Catalog=<guid>;`, ready for `dax_query`. |

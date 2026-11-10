@@ -75,6 +75,22 @@ Xpress decompression and the plain/binary XML parsers are reused unchanged.
 
   The port file parser and the title parsing are tested offline.
 
+## Findings from the first Windows run
+
+These come from Power BI Desktop, Microsoft Store install:
+
+- TCP connect and DIME framing work. The server answers `Authenticate` with a
+  `text/xml` DIME message.
+- Authentication is required. Sending `Discover` without `Authenticate`
+  makes the server reset the connection (WSA error 10054).
+- Negotiate (SPNEGO) carries NTLM on loopback. The first round returns an
+  SPNEGO `negTokenResp` with an NTLM challenge.
+- The server wraps the base64 `SspiHandshake` in 76-character lines with
+  line breaks. The parser now strips whitespace before decoding.
+- The window title can be just the report name, without the
+  ` - Power BI Desktop` suffix. `report_name` now uses the title itself in
+  that case.
+
 ## Open questions the Windows probe answers
 
 1. Does Desktop's `msmdsrv` accept requests without `Authenticate` (attempt

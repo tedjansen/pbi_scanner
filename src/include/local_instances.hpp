@@ -18,8 +18,10 @@ vector<string> LocalInstancesNamedParameterNames();
 //! not a port number between 1 and 65535.
 bool ParseMsmdsrvPortFile(const std::string &bytes, uint16_t &port_out);
 
-//! Strips the " - Power BI Desktop" suffix from a PBIDesktop.exe window title.
-//! Returns an empty string for titles without the suffix.
+//! Report name from a PBIDesktop.exe window title: strips a
+//! " - Power BI Desktop" suffix when present, otherwise returns the trimmed
+//! title. Returns an empty string for an empty title or the bare product name.
+bool DesktopWindowTitleHasSuffix(const std::string &title);
 std::string ReportNameFromDesktopWindowTitle(const std::string &title);
 
 std::string BuildLocalConnectionString(uint16_t port,

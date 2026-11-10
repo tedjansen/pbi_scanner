@@ -78,6 +78,16 @@ bool ParseMsmdsrvPortFile(const std::string &bytes, uint16_t &port_out) {
   return true;
 }
 
+bool DesktopWindowTitleHasSuffix(const std::string &title) {
+  auto trimmed = Trimmed(title);
+  for (auto *suffix : DESKTOP_TITLE_SUFFIXES) {
+    if (StringUtil::EndsWith(trimmed, suffix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string ReportNameFromDesktopWindowTitle(const std::string &title) {
   auto trimmed = Trimmed(title);
   for (auto *suffix : DESKTOP_TITLE_SUFFIXES) {
@@ -85,7 +95,12 @@ std::string ReportNameFromDesktopWindowTitle(const std::string &title) {
       return Trimmed(trimmed.substr(0, trimmed.size() - std::strlen(suffix)));
     }
   }
-  return std::string();
+  // Recent Desktop builds (observed on the Microsoft Store install) show just
+  // the report name. The bare product name is the start screen, not a report.
+  if (StringUtil::CIEquals(trimmed, "Power BI Desktop")) {
+    return std::string();
+  }
+  return trimmed;
 }
 
 std::string BuildLocalConnectionString(uint16_t port,
@@ -220,11 +235,12 @@ static BOOL CALLBACK CollectDesktopWindowTitle(HWND window, LPARAM param) {
     return TRUE;
   }
   auto text = NarrowWide(std::wstring(title, static_cast<size_t>(length)));
-  if (!ReportNameFromDesktopWindowTitle(text).empty()) {
+  if (DesktopWindowTitleHasSuffix(text)) {
     search.best_title = text;
     return FALSE;
   }
-  if (search.best_title.empty()) {
+  if (search.best_title.empty() &&
+      !ReportNameFromDesktopWindowTitle(text).empty()) {
     search.best_title = text;
   }
   return TRUE;
