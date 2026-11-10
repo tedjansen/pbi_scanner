@@ -63,17 +63,38 @@ Xpress decompression and the plain/binary XML parsers are reused unchanged.
   of every message on stderr.
 - `src/local_instances.cpp`: the `pbi_local_instances()` table function
   (Windows only). It builds the list as follows:
-  - lists `msmdsrv.exe` processes (Toolhelp snapshot);
+  - lists `msmdsrv.exe` processes (Toolhelp snapshot). Instances whose
+    parent is `services.exe` (an SSAS service) or `RSHostingService.exe`
+    (Power BI Report Server) are skipped;
   - gets their listening ports (`GetExtendedTcpTable`, IPv4 and IPv6). This
-    is more reliable than port files, which stay behind after a crash;
-  - finds the parent `PBIDesktop.exe` and its top-level window title
-    (`<report> - Power BI Desktop`) for the report name;
+    is more reliable than port files, which stay behind after a crash. Some
+    Windows 11 builds (KB5127936) report the listener with state 0, so an
+    unconnected socket on a loopback or wildcard address also counts;
+  - finds the parent process and its top-level window title for the report
+    name. The title is `<report> - Power BI Desktop`, or just `<report>`.
+    The separator varies with the UI language (hyphen, minus sign, en/em
+    dash, and so on);
   - matches ports to `AnalysisServicesWorkspaces\*\Data\msmdsrv.port.txt`
     (UTF-16) for the workspace folder;
   - optionally discovers the catalog GUID over TCP;
   - returns a ready `connection_string`.
 
   The port file parser and the title parsing are tested offline.
+
+## Prior art
+
+- [DAX Studio](https://github.com/DaxStudio/DaxStudio) does not implement the
+  protocol itself. It connects through Microsoft's closed-source ADOMD.NET
+  (`Microsoft.AnalysisServices.AdomdClient`) with `Data Source=localhost:<port>`
+  and integrated security. Its instance discovery
+  (`src/DaxStudio.Core/Utils/PowerBIHelper.cs`, `ManagedIpHelper.cs`) uses the
+  same approach as `pbi_local_instances`: `msmdsrv` processes, their parent
+  process and window title, and the TCP table. The parent filtering, the
+  localized title separators and the state-0 listener workaround are taken
+  from it as behaviour, not as code.
+- Tabular Editor, Bravo and pyadomd also wrap Microsoft's AMO/TOM or
+  ADOMD.NET client libraries. No open-source native implementation of the TCP
+  protocol turned up, so `[MS-SSAS]` stays the reference for the wire format.
 
 ## Findings from the first Windows run
 

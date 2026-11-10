@@ -667,6 +667,17 @@ TEST_CASE("Report name from Power BI Desktop window title",
   REQUIRE(!DesktopWindowTitleHasSuffix("Uren"));
   REQUIRE(DesktopWindowTitleHasSuffix("Sales Model - Power BI Desktop"));
   REQUIRE(ReportNameFromDesktopWindowTitle("Power BI Desktop").empty());
+  // Localized separators (sql-bi/Bravo#476).
+  for (auto dash :
+       {"\xE2\x88\x92", "\xE2\x80\x91", "\xE2\x80\x94", "\xE2\x80\x95"}) {
+    REQUIRE(ReportNameFromDesktopWindowTitle(std::string("Uren ") + dash +
+                                             " Power BI Desktop") == "Uren");
+  }
+
+  REQUIRE(IsTcpListenerCandidate(2, false, false));
+  REQUIRE(IsTcpListenerCandidate(0, true, true));
+  REQUIRE(!IsTcpListenerCandidate(5, true, false));
+  REQUIRE(!IsTcpListenerCandidate(0, false, true));
   REQUIRE(ReportNameFromDesktopWindowTitle("").empty());
 
   REQUIRE(BuildLocalConnectionString(60790, "") ==

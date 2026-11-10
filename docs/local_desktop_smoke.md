@@ -34,7 +34,8 @@ Get-Content instances.csv
 | `port` | The listening TCP port of `msmdsrv.exe`. |
 | `catalog` | The database GUID, from `DBSCHEMA_CATALOGS`. |
 | `connection_string` | `Data Source=localhost:<port>;Initial Catalog=<guid>;`, ready for `dax_query`. |
-| `msmdsrv_pid`, `desktop_pid` | The process IDs. |
+| `host_process` | The parent process: `PBIDesktop.exe` for Desktop, `devenv.exe` for a Visual Studio workspace. |
+| `msmdsrv_pid`, `host_pid` | The process IDs. |
 | `window_title` | The raw window title. |
 | `workspace_path` | The workspace folder whose `msmdsrv.port.txt` holds this port. |
 | `detail` | Problems such as a failed catalog lookup, or more than one catalog. |

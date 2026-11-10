@@ -28,8 +28,28 @@
 
 namespace duckdb {
 
+// The separator depends on the Desktop UI language (see sql-bi/Bravo#476 and
+// DAX Studio's PowerBIInstance): hyphen-minus, minus sign, non-breaking
+// hyphen, en dash, em dash and horizontal bar, all UTF-8 encoded.
 static constexpr const char *DESKTOP_TITLE_SUFFIXES[] = {
-    " - Power BI Desktop", " \xE2\x80\x93 Power BI Desktop"};
+    " - Power BI Desktop",
+    " \xE2\x88\x92 Power BI Desktop",
+    " \xE2\x80\x91 Power BI Desktop",
+    " \xE2\x80\x93 Power BI Desktop",
+    " \xE2\x80\x94 Power BI Desktop",
+    " \xE2\x80\x95 Power BI Desktop"};
+
+bool IsTcpListenerCandidate(uint32_t state, bool local_loopback_or_any,
+                            bool remote_unspecified) {
+  // MIB_TCP_STATE_LISTEN. Some Windows 11 builds (KB5127936) report the
+  // msmdsrv listening sockets with state 0 instead, so like DAX Studio also
+  // accept an unconnected socket on a loopback or wildcard address.
+  static constexpr uint32_t TCP_STATE_LISTEN = 2;
+  if (state == TCP_STATE_LISTEN) {
+    return true;
+  }
+  return local_loopback_or_any && remote_unspecified;
+}
 
 bool ParseMsmdsrvPortFile(const std::string &bytes, uint16_t &port_out) {
   std::string text;
@@ -117,7 +137,8 @@ namespace {
 
 struct LocalInstanceRow {
   int64_t pid = 0;
-  int64_t desktop_pid = 0;
+  int64_t host_pid = 0;
+  std::string host_process;
   uint16_t port = 0;
   std::string report_name;
   std::string window_title;
@@ -182,7 +203,7 @@ static std::vector<char> ReadTcpTable(ULONG family) {
   for (int attempt = 0; attempt < 5; attempt++) {
     auto result =
         GetExtendedTcpTable(buffer.empty() ? nullptr : buffer.data(), &size,
-                            FALSE, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                            FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0);
     if (result == NO_ERROR) {
       return buffer;
     }
@@ -201,16 +222,36 @@ static std::map<DWORD, std::set<uint16_t>> ListeningPortsByPid() {
   if (!v4.empty()) {
     auto table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(v4.data());
     for (DWORD i = 0; i < table->dwNumEntries; i++) {
-      ports[table->table[i].dwOwningPid].insert(
-          ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
+      auto &row = table->table[i];
+      auto local = ntohl(row.dwLocalAddr);
+      auto local_loopback_or_any = local == 0 || (local >> 24) == 127;
+      auto remote_unspecified = row.dwRemoteAddr == 0 && row.dwRemotePort == 0;
+      if (IsTcpListenerCandidate(row.dwState, local_loopback_or_any,
+                                 remote_unspecified)) {
+        ports[row.dwOwningPid].insert(
+            ntohs(static_cast<u_short>(row.dwLocalPort)));
+      }
     }
   }
   auto v6 = ReadTcpTable(AF_INET6);
   if (!v6.empty()) {
     auto table = reinterpret_cast<PMIB_TCP6TABLE_OWNER_PID>(v6.data());
     for (DWORD i = 0; i < table->dwNumEntries; i++) {
-      ports[table->table[i].dwOwningPid].insert(
-          ntohs(static_cast<u_short>(table->table[i].dwLocalPort)));
+      auto &row = table->table[i];
+      bool local_any = true;
+      bool local_loopback = true;
+      bool remote_any = true;
+      for (int b = 0; b < 16; b++) {
+        local_any = local_any && row.ucLocalAddr[b] == 0;
+        local_loopback =
+            local_loopback && row.ucLocalAddr[b] == (b == 15 ? 1 : 0);
+        remote_any = remote_any && row.ucRemoteAddr[b] == 0;
+      }
+      if (IsTcpListenerCandidate(row.dwState, local_any || local_loopback,
+                                 remote_any && row.dwRemotePort == 0)) {
+        ports[row.dwOwningPid].insert(
+            ntohs(static_cast<u_short>(row.dwLocalPort)));
+      }
     }
   }
   return ports;
@@ -333,11 +374,20 @@ static vector<LocalInstanceRow> DiscoverLocalInstances() {
     LocalInstanceRow base;
     base.pid = entry.first;
     auto parent = processes.find(entry.second.parent);
-    if (parent != processes.end() &&
-        IsExe(parent->second.exe, L"PBIDesktop.exe")) {
-      base.desktop_pid = parent->first;
+    if (parent != processes.end()) {
+      // Same rules as DAX Studio: an msmdsrv started by the service control
+      // manager is an SSAS service instance, one under RSHostingService
+      // belongs to Power BI Report Server. Neither is a Desktop model.
+      if (IsExe(parent->second.exe, L"services.exe") ||
+          IsExe(parent->second.exe, L"RSHostingService.exe")) {
+        continue;
+      }
+      base.host_pid = parent->first;
+      base.host_process = NarrowWide(parent->second.exe);
       base.window_title = DesktopWindowTitle(parent->first);
-      base.report_name = ReportNameFromDesktopWindowTitle(base.window_title);
+      if (IsExe(parent->second.exe, L"PBIDesktop.exe")) {
+        base.report_name = ReportNameFromDesktopWindowTitle(base.window_title);
+      }
     }
     auto pid_ports = ports.find(entry.first);
     if (pid_ports == ports.end() || pid_ports->second.empty()) {
@@ -453,16 +503,18 @@ LocalInstancesBind(ClientContext &, TableFunctionBindInput &input,
       "pbi_scanner");
 #endif
 
-  return_types = {
-      LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-      LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
-      LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+  return_types = {LogicalType::VARCHAR, LogicalType::INTEGER,
+                  LogicalType::VARCHAR, LogicalType::VARCHAR,
+                  LogicalType::VARCHAR, LogicalType::BIGINT,
+                  LogicalType::BIGINT,  LogicalType::VARCHAR,
+                  LogicalType::VARCHAR, LogicalType::VARCHAR};
   AddName(names, "report_name");
   AddName(names, "port");
   AddName(names, "catalog");
   AddName(names, "connection_string");
+  AddName(names, "host_process");
   AddName(names, "msmdsrv_pid");
-  AddName(names, "desktop_pid");
+  AddName(names, "host_pid");
   AddName(names, "window_title");
   AddName(names, "workspace_path");
   AddName(names, "detail");
@@ -490,13 +542,14 @@ static void LocalInstancesExecute(ClientContext &, TableFunctionInput &input,
                     row.port == 0 ? Value(LogicalType::VARCHAR)
                                   : Value(BuildLocalConnectionString(
                                         row.port, row.catalog)));
-    output.SetValue(4, count, Value::BIGINT(row.pid));
-    output.SetValue(5, count,
-                    row.desktop_pid == 0 ? Value(LogicalType::BIGINT)
-                                         : Value::BIGINT(row.desktop_pid));
-    output.SetValue(6, count, OptionalText(row.window_title));
-    output.SetValue(7, count, OptionalText(row.workspace_path));
-    output.SetValue(8, count, OptionalText(row.detail));
+    output.SetValue(4, count, OptionalText(row.host_process));
+    output.SetValue(5, count, Value::BIGINT(row.pid));
+    output.SetValue(6, count,
+                    row.host_pid == 0 ? Value(LogicalType::BIGINT)
+                                      : Value::BIGINT(row.host_pid));
+    output.SetValue(7, count, OptionalText(row.window_title));
+    output.SetValue(8, count, OptionalText(row.workspace_path));
+    output.SetValue(9, count, OptionalText(row.detail));
     count++;
   }
   output.SetCardinality(count);
