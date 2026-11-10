@@ -146,6 +146,25 @@ These come from Power BI Desktop, Microsoft Store install:
   probed with `xpress`, so booleans must be checked through `dax_query` once
   local targets are wired in.
 
+## Findings from the full dax_query run
+
+- `pbi_local_instances()` now fills `catalog`, and the connection string it
+  returns works directly in `dax_query`.
+- `dax_query` works with and without `Initial Catalog`.
+- Types match the plan: BIGINT, DOUBLE for `CURRENCY` and division, DATE,
+  TIMESTAMP, VARCHAR and BOOLEAN. An all-`BLANK()` column is not part of the
+  server's schema.
+- `pbi_tables`, `pbi_columns`, `pbi_measures` and `pbi_relationships` work,
+  with and without `normalize_dax_column_names`.
+- A 398-row table returns the same row count on `sx_xpress`, `xpress` and
+  `plain`, in about 70 ms each.
+- The error messages are clear: connection refused, a rejected
+  `access_token`, and a DAX error passed through from the server.
+- Bug found and fixed: with `sx_xpress`, BOOLEAN values were `NULL`, because
+  [MS-BINXML] XSD-BOOLEAN (`0x86` plus a value byte) was decoded as empty
+  text. This affects the service path as well. It is covered by a fixture
+  captured from Desktop.
+
 ## Open questions the Windows probe answers
 
 1. Does Desktop's `msmdsrv` accept requests without `Authenticate` (attempt
@@ -203,12 +222,9 @@ These come from Power BI Desktop, Microsoft Store install:
 
 ## Next steps
 
-1. Windows smoke test (step 4 of the smoke doc). Compare types and values
-   across the `sx_xpress`, `xpress` and `plain` transports, and against the
-   published model.
-2. If BOOLEAN or other sx tokens decode differently from `xpress`, capture
-   the bodies with `PBI_SCANNER_LOCAL_DUMP_DIR` and turn them into Catch
-   fixtures.
+1. Re-run step 4d/4e of the smoke doc to confirm BOOLEAN values on
+   `sx_xpress` after the XSD-BOOLEAN fix.
+2. Compare a few queries with the published model (service path).
 3. Decide whether to keep `pbi_local_probe` as a documented diagnostic.
 4. Upstream PR (crazy-treyn/pbi_scanner#19), once the maintainer agrees.
 
